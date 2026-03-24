@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.myak.export</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__MYAK_EXPORT_BIN__</string>
+        <string>--vault</string>
+        <string>__OBSIDIAN_VAULT__</string>
+        <string>--since</string>
+        <string>7</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>17</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/tmp/myak-export.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/myak-export.log</string>
+</dict>
+</plist>

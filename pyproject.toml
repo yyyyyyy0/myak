@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "myak"
+version = "0.1.0"
+description = "Persistent memory for Claude Code — auto-index sessions, FTS5 search, Obsidian export"
+requires-python = ">=3.10"
+license = "MIT"
+
+[tool.setuptools.packages.find]
+include = ["myak*"]
+
+[project.scripts]
+myak-index = "myak.indexer:main"
+myak-query = "myak.query:main"
+myak-backfill = "myak.backfill:main"
+myak-export = "myak.export_obsidian:main"
