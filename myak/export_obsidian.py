@@ -151,7 +151,8 @@ def export(vault_dir, since_days=None, project_filter=None):
         note_content, title = format_session_note(dict(session), segments, project_name)
         date = session["started_at"][:10]
         safe_title = sanitize_filename(title)
-        filename = f"{date}-{safe_title}.md"
+        suffix = session_id[:8]
+        filename = f"{date}-{safe_title}-{suffix}.md"
 
         project_dir = sessions_dir / project_name
         project_dir.mkdir(parents=True, exist_ok=True)

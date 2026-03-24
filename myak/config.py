@@ -20,6 +20,16 @@ MAX_RESULTS = 5
 MAX_SNIPPET_CHARS = 500
 MAX_CODEX_CHARS = 1000
 
+# Hook 用: 注入量を抑える
+HOOK_MAX_RESULTS = 3
+HOOK_SNIPPET_CHARS = 220
+
+# 検索品質: 閾値フィルタ
+MIN_RELATIVE_SCORE = 0.35  # best score 比
+MIN_ABSOLUTE_SCORE = 0.03
+MIN_MATCHING_TOKENS = 2    # TOKEN_MATCH_GUARD 以上のトークン数で適用
+TOKEN_MATCH_GUARD = 3
+
 
 def home_parts():
     """ホームディレクトリのパーツを返す（slug 変換時の除外用）。"""

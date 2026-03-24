@@ -198,18 +198,15 @@ def run_from_hook():
     except (json.JSONDecodeError, ValueError):
         return
 
-    session_id = hook_input.get("session_id", "")
+    transcript_path = hook_input.get("transcript_path", "")
     cwd = hook_input.get("cwd", "")
     project_slug = cwd_to_project_slug(cwd) if cwd else None
 
-    jsonl_path = None
-    if session_id:
-        jsonl_path = find_jsonl_for_session(session_id, project_slug)
+    if not transcript_path:
+        return
 
-    if not jsonl_path and project_slug:
-        jsonl_path = find_latest_jsonl(project_slug)
-
-    if not jsonl_path:
+    jsonl_path = Path(transcript_path).expanduser()
+    if not jsonl_path.exists():
         return
 
     ensure_memory_dir()
