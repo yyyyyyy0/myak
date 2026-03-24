@@ -14,6 +14,8 @@ DESKTOP_SESSION_PREFIX = "desktop-"
 
 def save_memory(content, role="assistant", session_id=None):
     """Save a memory segment to the database."""
+    if not isinstance(content, str):
+        return {"saved": False, "reason": "Content must be a string"}
     if len(content.strip()) < 10:
         return {"saved": False, "reason": "Content too short (min 10 chars)"}
 
@@ -145,7 +147,8 @@ def handle_request(request):
 
         if tool_name == "myak_search":
             query = arguments.get("query", "")
-            limit = min(arguments.get("limit", 5), 20)
+            raw_limit = arguments.get("limit", 5)
+            limit = max(1, min(int(raw_limit) if isinstance(raw_limit, (int, float)) else 5, 20))
 
             if len(query) < 3:
                 return {
