@@ -128,17 +128,19 @@ The installer adds two hooks to `~/.claude/settings.json`:
 
 ```json
 {
-  "Stop": [{
-    "matcher": "*",
-    "hooks": [{ "type": "command", "command": "myak-index", "async": true }]
-  }],
-  "UserPromptSubmit": [{
-    "matcher": "*",
-    "hooks": [{
-      "type": "command",
-      "command": "query=$(cat | python3 -c \"...\"); myak-query --hook \"$query\""
+  "hooks": {
+    "Stop": [{
+      "matcher": "*",
+      "hooks": [{ "type": "command", "command": "myak-index", "async": true }]
+    }],
+    "UserPromptSubmit": [{
+      "matcher": "*",
+      "hooks": [{
+        "type": "command",
+        "command": "query=$(cat | python3 -c \"...\"); myak-query --hook \"$query\""
+      }]
     }]
-  }]
+  }
 }
 ```
 
