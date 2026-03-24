@@ -7,7 +7,7 @@ Persistent memory for Claude Code. Automatically indexes session transcripts int
 ## What it does
 
 1. **Auto-index** — A Claude Code hook runs `myak-index` at the end of every session, extracting conversation segments into a local SQLite database with full-text search (FTS5 trigram).
-2. **Auto-recall** — On each prompt, a `UserPromptSubmit` hook searches memory for related context and injects it as a system message. Claude sees relevant past conversations without you doing anything.
+2. **Auto-recall** — On each prompt, a `UserPromptSubmit` hook searches memory for related context and injects it as additional context via `additionalContext`. Results are filtered by relevance threshold and deduplicated per session, so only meaningful matches reach Claude.
 3. **Manual search** — `myak-query` lets you search memory from the terminal.
 4. **Backfill** — `myak-backfill` indexes all existing session transcripts at once.
 5. **Obsidian export** — `myak-export` turns your session history into Markdown notes for Obsidian, organized by project.
@@ -137,17 +137,24 @@ The installer adds two hooks to `~/.claude/settings.json`:
     }],
     "UserPromptSubmit": [{
       "matcher": "*",
-      "hooks": [{
-        "type": "command",
-        "command": "query=$(cat | python3 -c \"...\"); myak-query --hook \"$query\""
-      }]
+      "hooks": [{ "type": "command", "command": "myak-query --hook" }]
     }]
   }
 }
 ```
 
-- **Stop** — indexes the session transcript after Claude finishes
-- **UserPromptSubmit** — searches memory on each prompt and injects matching context
+- **Stop** — reads `transcript_path` from hook input and indexes the session transcript
+- **UserPromptSubmit** — reads `prompt` from hook input, searches memory, and returns matching context via `additionalContext`
+
+### Recall quality
+
+Hook recall applies multiple filters to reduce noise:
+
+- **Absolute score threshold** — drops results with FTS5 score below `MIN_ABSOLUTE_SCORE`
+- **Relative score threshold** — drops results scoring less than 35% of the best result
+- **Token match guard** — for queries with 3+ tokens, requires at least 2 tokens to match
+- **Session deduplication** — returns at most 1 result per session in hook mode
+- **Compact payload** — hook mode returns up to 3 results (vs 5 in CLI mode), each truncated to 220 chars
 
 ## Configuration
 

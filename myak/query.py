@@ -11,9 +11,15 @@ from datetime import datetime, timezone
 from myak.config import (
     DB_PATH,
     HALF_LIFE_DAYS,
+    HOOK_MAX_RESULTS,
+    HOOK_SNIPPET_CHARS,
     MAX_CODEX_CHARS,
     MAX_RESULTS,
     MAX_SNIPPET_CHARS,
+    MIN_ABSOLUTE_SCORE,
+    MIN_MATCHING_TOKENS,
+    MIN_RELATIVE_SCORE,
+    TOKEN_MATCH_GUARD,
 )
 
 
@@ -29,14 +35,26 @@ def time_decay_score(timestamp_str, base_score):
         return base_score * 0.5
 
 
-def tokenize_query(query):
-    """長いクエリを FTS5 trigram 向けに OR 結合のトークンに分割する。"""
+def _normalize_tokens(query):
+    """クエリを正規化してトークンリストを返す（共通処理）。"""
     cleaned = re.sub(
         r'[、。！？\s,.\-:;!?()（）「」『』\[\]{}'
         r'のにをはがでとからまでについてください]',
         ' ', query,
     )
     tokens = [t.strip() for t in cleaned.split() if len(t.strip()) >= 3]
+    seen = set()
+    unique = []
+    for t in tokens:
+        if t not in seen:
+            seen.add(t)
+            unique.append(t)
+    return unique
+
+
+def tokenize_query(query):
+    """長いクエリを FTS5 trigram 向けに OR 結合のトークンに分割する。"""
+    tokens = _normalize_tokens(query)
     if len(tokens) < 2 and len(query) >= 6:
         tokens = []
         clean_q = re.sub(r'[、。！？\s,.\-:;!?()（）「」『』\[\]{}]', '', query)
@@ -46,13 +64,44 @@ def tokenize_query(query):
                 tokens.append(chunk)
     if not tokens:
         return query
-    seen = set()
-    unique = []
-    for t in tokens:
-        if t not in seen:
-            seen.add(t)
-            unique.append(t)
-    return " OR ".join(f'"{t}"' for t in unique[:5])
+    return " OR ".join(f'"{t}"' for t in tokens[:5])
+
+
+def tokenize_query_terms(query):
+    """クエリからマッチング判定用のトークンリストを抽出する。"""
+    return _normalize_tokens(query)[:5]
+
+
+def matching_token_count(content, tokens):
+    """コンテンツ内のトークン一致数を返す。"""
+    lower = content.lower()
+    return sum(1 for t in tokens if t.lower() in lower)
+
+
+def filter_results(results, tokens, *, hook_mode=False):
+    """閾値フィルタ + session dedupe。結果はスコア降順にソートされる。"""
+    if not results:
+        return []
+
+    results = sorted(results, key=lambda r: r["score"], reverse=True)
+    best = results[0]["score"]
+    filtered = []
+    seen_sessions = set()
+
+    for r in results:
+        if r["score"] < MIN_ABSOLUTE_SCORE:
+            continue
+        if best > 0 and r["score"] < best * MIN_RELATIVE_SCORE:
+            continue
+        if len(tokens) >= TOKEN_MATCH_GUARD and matching_token_count(r["content"], tokens) < MIN_MATCHING_TOKENS:
+            continue
+        if hook_mode:
+            sid = r["session_id"]
+            if sid in seen_sessions:
+                continue
+            seen_sessions.add(sid)
+        filtered.append(r)
+    return filtered
 
 
 def search(query, max_results=MAX_RESULTS):
@@ -115,11 +164,11 @@ def format_hook(results, query):
     if not results:
         return ""
     lines = ["## 関連する過去の記憶", ""]
-    for r in results:
+    for r in results[:HOOK_MAX_RESULTS]:
         project = r["project"].split("-")[-1] if r["project"] else "?"
-        lines.append(f"[{r['timestamp']} | {project}] {r['content'][:300]}")
+        lines.append(f"[{r['timestamp']} | {project}] {r['content'][:HOOK_SNIPPET_CHARS]}")
         lines.append("")
-    return json.dumps({"system_message": "\n".join(lines)}, ensure_ascii=False)
+    return json.dumps({"additionalContext": "\n".join(lines)}, ensure_ascii=False)
 
 
 def format_codex(results, query):
@@ -149,9 +198,9 @@ def main():
     if not query and args.hook:
         try:
             data = json.loads(sys.stdin.read())
-            message = data.get("message", "")
-            if isinstance(message, str):
-                query = message[:200].strip()
+            prompt = data.get("prompt", "")
+            if isinstance(prompt, str):
+                query = prompt[:200].strip()
         except (json.JSONDecodeError, ValueError):
             pass
 
@@ -170,6 +219,8 @@ def main():
     results = search(query, args.limit)
 
     if args.hook:
+        tokens = tokenize_query_terms(query)
+        results = filter_results(results, tokens, hook_mode=True)
         output = format_hook(results, query)
         if output:
             print(output)
