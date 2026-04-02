@@ -1,11 +1,10 @@
 """myak MCP server — expose memory search and save to Claude Desktop."""
 
 import json
-import sqlite3
 import sys
 from datetime import datetime, timezone
 
-from myak.config import DB_PATH, ensure_memory_dir
+from myak.config import ensure_memory_dir, get_connection
 from myak.indexer import init_db
 from myak.query import search, format_plain
 
@@ -24,7 +23,7 @@ def save_memory(content, role="assistant", session_id=None):
         session_id = f"{DESKTOP_SESSION_PREFIX}{now.strftime('%Y%m%d-%H%M%S')}"
 
     ensure_memory_dir()
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = get_connection()
     try:
         init_db(conn)
 

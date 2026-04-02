@@ -5,17 +5,16 @@ Stop hook から stdin 経由、または CLI 引数で呼ばれる。
 
 import argparse
 import json
-import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 from myak.config import (
-    DB_PATH,
     MAX_CONTENT_LENGTH,
     MIN_CONTENT_LENGTH,
     PROJECTS_DIR,
     ensure_memory_dir,
+    get_connection,
 )
 
 
@@ -210,7 +209,7 @@ def run_from_hook():
         return
 
     ensure_memory_dir()
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = get_connection()
     try:
         init_db(conn)
         count = index_session(conn, jsonl_path, project_slug)
@@ -241,7 +240,7 @@ def run_from_cli():
         sys.exit(1)
 
     ensure_memory_dir()
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = get_connection()
     try:
         init_db(conn)
         count = index_session(conn, jsonl_path, args.project)

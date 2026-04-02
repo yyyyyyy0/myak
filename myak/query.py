@@ -4,7 +4,6 @@ import argparse
 import json
 import math
 import re
-import sqlite3
 import sys
 from datetime import datetime, timezone
 
@@ -20,6 +19,7 @@ from myak.config import (
     MIN_MATCHING_TOKENS,
     MIN_RELATIVE_SCORE,
     TOKEN_MATCH_GUARD,
+    get_connection,
 )
 
 
@@ -111,7 +111,7 @@ def search(query, max_results=MAX_RESULTS):
 
     fts_query = tokenize_query(query)
 
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = get_connection()
     try:
         rows = conn.execute(
             """
