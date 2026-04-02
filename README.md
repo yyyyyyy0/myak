@@ -156,6 +156,20 @@ Hook recall applies multiple filters to reduce noise:
 - **Session deduplication** — returns at most 1 result per session in hook mode
 - **Compact payload** — hook mode returns up to 3 results (vs 5 in CLI mode), each truncated to 220 chars
 
+## Cross-machine sync
+
+myak uses SQLite with `journal_mode=DELETE`, so the database is always a single self-contained file (`~/.claude/memory/memory.db`) with no sidecar files (`.db-wal`, `.db-shm`).
+
+This means you can sync your memory across machines (e.g., Mac ↔ Windows) by syncing the `~/.claude/memory/` directory with any file sync tool:
+
+- [Syncthing](https://syncthing.net/) (recommended)
+- iCloud Drive / OneDrive (symlink `~/.claude/memory/` into your cloud folder)
+- rsync / manual copy
+
+Both machines share the same conversation history and recall results automatically.
+
+> **Note:** Avoid using both machines simultaneously for heavy write operations (e.g., running `myak-backfill` on both at once). Normal usage (sessions ending on one machine at a time) is safe.
+
 ## Configuration
 
 | Environment variable | Default | Description |
