@@ -140,7 +140,8 @@ def export(vault_dir, since_days=None, project_filter=None):
 
         segments = [
             dict(r) for r in conn.execute(
-                "SELECT role, content, timestamp FROM segments WHERE session_id = ? ORDER BY timestamp",
+                "SELECT role, content, timestamp FROM segments "
+                "WHERE session_id = ? ORDER BY timestamp",
                 (session_id,),
             ).fetchall()
         ]

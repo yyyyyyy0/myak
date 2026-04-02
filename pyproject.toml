@@ -18,3 +18,29 @@ myak-query = "myak.query:main"
 myak-backfill = "myak.backfill:main"
 myak-export = "myak.export_obsidian:main"
 myak-mcp = "myak.mcp_server:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0",
+    "pytest-cov>=7.0",
+    "coverage[toml]>=7.0",
+    "ruff>=0.4",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=myak --cov-report=term-missing --cov-fail-under=42"
+
+[tool.coverage.run]
+source = ["myak"]
+omit = ["myak/__init__.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]

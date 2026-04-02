@@ -7,7 +7,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 from myak.indexer import (
-    extract_segments,
     index_session,
     init_db,
     run_from_hook,
@@ -17,9 +16,25 @@ from myak.indexer import (
 def _make_jsonl(tmp_dir, session_id="test-session-001", messages=None):
     """テスト用 JSONL を生成する。"""
     if messages is None:
+        user_text = (
+            "これはテストメッセージです。十分な長さが必要です。"
+            "セグメントとして保存されるためには最低50文字以上の内容が含まれている必要があります。"
+        )
+        assistant_text = (
+            "アシスタントの応答です。これも十分な長さが必要です。"
+            "セグメントとして保存されるためには最低50文字以上の内容が含まれている必要があります。"
+        )
         messages = [
-            {"type": "user", "message": {"role": "user", "content": "これはテストメッセージです。十分な長さが必要です。セグメントとして保存されるためには最低50文字以上の内容が含まれている必要があります。"}, "timestamp": "2025-03-20T10:00:00Z"},
-            {"type": "assistant", "message": {"role": "assistant", "content": "アシスタントの応答です。これも十分な長さが必要です。セグメントとして保存されるためには最低50文字以上の内容が含まれている必要があります。"}, "timestamp": "2025-03-20T10:01:00Z"},
+            {
+                "type": "user",
+                "message": {"role": "user", "content": user_text},
+                "timestamp": "2025-03-20T10:00:00Z",
+            },
+            {
+                "type": "assistant",
+                "message": {"role": "assistant", "content": assistant_text},
+                "timestamp": "2025-03-20T10:01:00Z",
+            },
         ]
     jsonl_path = Path(tmp_dir) / f"{session_id}.jsonl"
     with open(jsonl_path, "w", encoding="utf-8") as f:

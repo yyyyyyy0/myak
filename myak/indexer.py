@@ -163,7 +163,8 @@ def index_session(conn, jsonl_path, project_slug=None):
 
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
-        "INSERT INTO sessions (session_id, project_path, started_at, ended_at, segment_count, indexed_at) "
+        "INSERT INTO sessions "
+        "(session_id, project_path, started_at, ended_at, segment_count, indexed_at) "
         "VALUES (?, ?, ?, ?, ?, ?)",
         (
             session_id,
