@@ -1,6 +1,7 @@
 """環境非依存のパス解決・設定管理。"""
 
 import os
+import sqlite3
 from pathlib import Path
 
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_DIR", Path.home() / ".claude"))
@@ -39,3 +40,10 @@ def home_parts():
 def ensure_memory_dir():
     """memory ディレクトリが存在しなければ作成する。"""
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def get_connection():
+    """同期セーフな SQLite 接続を返す。DELETE journal で WAL ファイル不要。"""
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute("PRAGMA journal_mode=DELETE")
+    return conn

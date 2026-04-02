@@ -7,7 +7,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from myak.config import DB_PATH, OBSIDIAN_VAULT, home_parts
+from myak.config import DB_PATH, OBSIDIAN_VAULT, get_connection, home_parts
 
 MAX_TITLE_LENGTH = 50
 
@@ -109,7 +109,7 @@ def export(vault_dir, since_days=None, project_filter=None):
         sys.exit(1)
 
     sessions_dir = vault_dir / "sessions"
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = get_connection()
     conn.row_factory = sqlite3.Row
 
     query = "SELECT * FROM sessions WHERE segment_count > 0"

@@ -1,17 +1,16 @@
 """既存セッションの一括バックフィル。"""
 
 import argparse
-import sqlite3
 import sys
 import time
 
-from myak.config import DB_PATH, PROJECTS_DIR, ensure_memory_dir
+from myak.config import PROJECTS_DIR, ensure_memory_dir, get_connection
 from myak.indexer import index_session, init_db
 
 
 def backfill(project_filter=None):
     ensure_memory_dir()
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = get_connection()
     init_db(conn)
 
     total_sessions = 0

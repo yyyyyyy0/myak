@@ -40,7 +40,11 @@ class TestFilenameCollision:
                 {"id": "ccccdddd-1111-2222-3333-444455556666", "project": "test-project", "date": "2025-03-20", "content": "同じタイトルの内容。テストのために十分な長さが必要です。"},
             ])
 
-            with patch("myak.export_obsidian.DB_PATH", db_path):
+            def fake_conn():
+                return sqlite3.connect(str(db_path))
+
+            with patch("myak.export_obsidian.DB_PATH", db_path), \
+                 patch("myak.export_obsidian.get_connection", fake_conn):
                 export(vault_dir)
 
             sessions_dir = vault_dir / "sessions"

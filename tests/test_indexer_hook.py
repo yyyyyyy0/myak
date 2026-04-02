@@ -40,7 +40,10 @@ class TestTranscriptPath:
                 "session_id": "test-session-001",
             })
 
-            with patch("myak.indexer.DB_PATH", db_path), \
+            def fake_conn():
+                return sqlite3.connect(str(db_path))
+
+            with patch("myak.indexer.get_connection", fake_conn), \
                  patch("myak.indexer.ensure_memory_dir"), \
                  patch("sys.stdin") as mock_stdin:
                 mock_stdin.read.return_value = hook_input
@@ -60,7 +63,10 @@ class TestTranscriptPath:
                 "session_id": "test-session-001",
             })
 
-            with patch("myak.indexer.DB_PATH", db_path), \
+            def fake_conn():
+                return sqlite3.connect(str(db_path))
+
+            with patch("myak.indexer.get_connection", fake_conn), \
                  patch("myak.indexer.ensure_memory_dir"), \
                  patch("sys.stdin") as mock_stdin:
                 mock_stdin.read.return_value = hook_input
@@ -77,7 +83,10 @@ class TestTranscriptPath:
                 "cwd": "/Users/nil/src/test-project",
             })
 
-            with patch("myak.indexer.DB_PATH", db_path), \
+            def fake_conn():
+                return sqlite3.connect(str(db_path))
+
+            with patch("myak.indexer.get_connection", fake_conn), \
                  patch("myak.indexer.ensure_memory_dir"), \
                  patch("sys.stdin") as mock_stdin:
                 mock_stdin.read.return_value = hook_input
