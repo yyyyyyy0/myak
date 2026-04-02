@@ -42,14 +42,8 @@ def ensure_memory_dir():
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 
 
-_journal_mode_set = False
-
-
 def get_connection():
     """同期セーフな SQLite 接続を返す。DELETE journal で WAL ファイル不要。"""
-    global _journal_mode_set
     conn = sqlite3.connect(str(DB_PATH))
-    if not _journal_mode_set:
-        conn.execute("PRAGMA journal_mode=DELETE")
-        _journal_mode_set = True
+    conn.execute("PRAGMA journal_mode=DELETE")
     return conn
