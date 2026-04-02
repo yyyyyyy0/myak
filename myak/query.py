@@ -93,7 +93,8 @@ def filter_results(results, tokens, *, hook_mode=False):
             continue
         if best > 0 and r["score"] < best * MIN_RELATIVE_SCORE:
             continue
-        if len(tokens) >= TOKEN_MATCH_GUARD and matching_token_count(r["content"], tokens) < MIN_MATCHING_TOKENS:
+        token_count = matching_token_count(r["content"], tokens)
+        if len(tokens) >= TOKEN_MATCH_GUARD and token_count < MIN_MATCHING_TOKENS:
             continue
         if hook_mode:
             sid = r["session_id"]

@@ -1,7 +1,6 @@
 """既存セッションの一括バックフィル。"""
 
 import argparse
-import sys
 import time
 
 from myak.config import PROJECTS_DIR, ensure_memory_dir, get_connection
@@ -44,7 +43,7 @@ def backfill(project_filter=None):
                     skipped += 1
 
         elapsed = time.time() - start
-        print(f"\n--- Backfill complete ---")
+        print("\n--- Backfill complete ---")
         print(f"Sessions indexed: {total_sessions}")
         print(f"Segments created: {total_segments}")
         print(f"Skipped (already indexed or empty): {skipped}")

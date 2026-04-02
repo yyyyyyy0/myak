@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from myak.config import ensure_memory_dir, get_connection
 from myak.indexer import init_db
-from myak.query import search, format_plain
+from myak.query import format_plain, search
 
 DESKTOP_SESSION_PREFIX = "desktop-"
 
@@ -32,7 +32,8 @@ def save_memory(content, role="assistant", session_id=None):
         ).fetchone()
         if not existing:
             conn.execute(
-                "INSERT INTO sessions (session_id, project_path, started_at, segment_count, indexed_at) "
+                "INSERT INTO sessions "
+                "(session_id, project_path, started_at, segment_count, indexed_at) "
                 "VALUES (?, ?, ?, 0, ?)",
                 (session_id, "claude-desktop", now.isoformat(), now.isoformat()),
             )
@@ -43,7 +44,8 @@ def save_memory(content, role="assistant", session_id=None):
             (session_id, role, content[:4000], timestamp),
         )
         conn.execute(
-            "UPDATE sessions SET segment_count = segment_count + 1, ended_at = ? WHERE session_id = ?",
+            "UPDATE sessions SET segment_count = segment_count + 1, "
+            "ended_at = ? WHERE session_id = ?",
             (timestamp, session_id),
         )
         conn.commit()
@@ -95,7 +97,10 @@ TOOLS = [
                 },
                 "role": {
                     "type": "string",
-                    "description": "Who produced this info: 'user' or 'assistant' (default: 'assistant').",
+                    "description": (
+                        "Who produced this info: "
+                        "'user' or 'assistant' (default: 'assistant')."
+                    ),
                     "enum": ["user", "assistant"],
                     "default": "assistant",
                 },
