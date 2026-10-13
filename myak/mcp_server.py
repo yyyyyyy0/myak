@@ -1,16 +1,28 @@
 """myak MCP server — expose memory search and save to Claude Desktop."""
 
 import hashlib
-import json
+import logging
+import re
 import sys
 from datetime import datetime, timezone
+from typing import Literal
 
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+
+from myak import __version__
 from myak.config import ensure_memory_dir, get_connection
 from myak.db import require_current
 from myak.indexer import init_db
 from myak.query import format_plain, search
 
 DESKTOP_SESSION_PREFIX = "desktop-"
+MAX_CONTENT_CHARS = 4000
+SESSION_ID_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+
+logger = logging.getLogger("myak.mcp")
+
+mcp = MCPServer("myak", version=__version__)
 
 
 def save_memory(content, role="assistant", session_id=None):
@@ -39,7 +51,7 @@ def save_memory(content, role="assistant", session_id=None):
             }
 
         timestamp = now.isoformat()
-        stored = content[:4000]
+        stored = content[:MAX_CONTENT_CHARS]  # safety net; the tool rejects longer input
         uuid = "save:" + hashlib.sha1(content.encode("utf-8")).hexdigest()[:16]
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -78,186 +90,59 @@ def save_memory(content, role="assistant", session_id=None):
         conn.close()
 
 
-TOOLS = [
-    {
-        "name": "myak_search",
-        "description": (
-            "Search past conversation memories across Claude Code and Claude Desktop sessions. "
-            "Returns relevant snippets ranked by relevance and recency. "
-            "Use this to recall past decisions, discussions, code changes, and context."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query (min 3 chars). Can be Japanese or English.",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max results to return (default 5, max 20).",
-                    "default": 5,
-                },
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "myak_save",
-        "description": (
-            "Save an important piece of information to long-term memory. "
-            "Use this to persist key decisions, facts, user preferences, or conversation summaries "
-            "so they can be recalled in future sessions (both Claude Desktop and Claude Code). "
-            "Keep content concise and self-contained."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "content": {
-                    "type": "string",
-                    "description": "The information to save (min 10 chars, max 4000 chars).",
-                },
-                "role": {
-                    "type": "string",
-                    "description": (
-                        "Who produced this info: "
-                        "'user' or 'assistant' (default: 'assistant')."
-                    ),
-                    "enum": ["user", "assistant"],
-                    "default": "assistant",
-                },
-                "session_id": {
-                    "type": "string",
-                    "description": (
-                        "Optional session ID to group related saves. "
-                        "Omit to auto-generate. Reuse to append to the same session."
-                    ),
-                },
-            },
-            "required": ["content"],
-        },
-    },
-]
+@mcp.tool(
+    name="myak_search",
+    description=(
+        "Search past conversation memories across Claude Code and Claude Desktop sessions. "
+        "Returns relevant snippets ranked by relevance and recency. "
+        "Use this to recall past decisions, discussions, code changes, and context."
+    ),
+)
+def myak_search(query: str, limit: int = 5) -> str:
+    """query: search query (min 3 chars, Japanese or English). limit: 1-20, default 5."""
+    query = query.strip()
+    if len(query) < 3:
+        raise ToolError("Query too short (min 3 chars)")
+    limit = max(1, min(limit, 20))
+    try:
+        results = search(query, max_results=limit)
+    except Exception as e:
+        logger.exception("myak_search failed")
+        raise ToolError(f"Search failed: {type(e).__name__}") from None
+    return format_plain(results, query)
 
 
-def handle_request(request):
-    """Handle a single JSON-RPC request."""
-    method = request.get("method", "")
-    req_id = request.get("id")
-    params = request.get("params", {})
-
-    if method == "initialize":
-        return {
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "myak", "version": "0.2.0"},
-            },
-        }
-
-    if method == "notifications/initialized":
-        return None
-
-    if method == "tools/list":
-        return {
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {"tools": TOOLS},
-        }
-
-    if method == "tools/call":
-        tool_name = params.get("name", "")
-        arguments = params.get("arguments", {})
-
-        if tool_name == "myak_search":
-            query = arguments.get("query", "")
-            raw_limit = arguments.get("limit", 5)
-            limit = max(1, min(int(raw_limit) if isinstance(raw_limit, (int, float)) else 5, 20))
-
-            if len(query) < 3:
-                return {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": {
-                        "content": [{"type": "text", "text": "Query too short (min 3 chars)"}],
-                        "isError": True,
-                    },
-                }
-
-            results = search(query, max_results=limit)
-            text = format_plain(results, query)
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {"content": [{"type": "text", "text": text}]},
-            }
-
-        if tool_name == "myak_save":
-            content = arguments.get("content", "")
-            role = arguments.get("role", "assistant")
-            session_id = arguments.get("session_id")
-
-            result = save_memory(content, role=role, session_id=session_id)
-
-            if result["saved"] and result.get("duplicate"):
-                text = f"Already saved (duplicate, session: {result['session_id']})"
-            elif result["saved"]:
-                text = f"Saved to memory (session: {result['session_id']})"
-            else:
-                text = f"Failed to save: {result['reason']}"
-
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {
-                    "content": [{"type": "text", "text": text}],
-                    "isError": not result["saved"],
-                },
-            }
-
-        return {
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"},
-        }
-
-    if method == "ping":
-        return {"jsonrpc": "2.0", "id": req_id, "result": {}}
-
-    if req_id is not None:
-        return {
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "error": {"code": -32601, "message": f"Method not found: {method}"},
-        }
-    return None
+@mcp.tool(
+    name="myak_save",
+    description=(
+        "Save an important piece of information to long-term memory. "
+        "Use this to persist key decisions, facts, user preferences, or conversation summaries "
+        "so they can be recalled in future sessions (both Claude Desktop and Claude Code). "
+        "Keep content concise and self-contained."
+    ),
+)
+def myak_save(
+    content: str,
+    role: Literal["user", "assistant"] = "assistant",
+    session_id: str | None = None,
+) -> str:
+    """content: info to save (10-4000 chars). role: who produced it. session_id: optional."""
+    if isinstance(content, str) and len(content) > MAX_CONTENT_CHARS:
+        raise ToolError(f"Content too long ({len(content)} chars; max {MAX_CONTENT_CHARS})")
+    if session_id is not None and not SESSION_ID_RE.fullmatch(session_id):
+        raise ToolError("Invalid session_id (max 64 chars of A-Z a-z 0-9 _ . : -)")
+    result = save_memory(content, role=role, session_id=session_id)
+    if result["saved"] and result.get("duplicate"):
+        return f"Already saved (duplicate, session: {result['session_id']})"
+    if result["saved"]:
+        return f"Saved to memory (session: {result['session_id']})"
+    raise ToolError(f"Failed to save: {result['reason']}")
 
 
 def main():
-    """Run MCP server over stdio."""
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-
-        try:
-            request = json.loads(line)
-        except json.JSONDecodeError:
-            error_resp = {
-                "jsonrpc": "2.0",
-                "id": None,
-                "error": {"code": -32700, "message": "Parse error"},
-            }
-            sys.stdout.write(json.dumps(error_resp) + "\n")
-            sys.stdout.flush()
-            continue
-
-        response = handle_request(request)
-        if response is not None:
-            sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
-            sys.stdout.flush()
+    """Run the MCP server over stdio (stdout is protocol-only; logs go to stderr)."""
+    logging.basicConfig(stream=sys.stderr, level=logging.WARNING)
+    mcp.run("stdio")
 
 
 if __name__ == "__main__":

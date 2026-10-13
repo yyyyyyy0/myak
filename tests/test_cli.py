@@ -16,7 +16,7 @@ from tests.idx_helpers import FIXTURES, count, rec, setup_env, text, write
 from tests.test_db_migration import make_v0
 
 REPO = Path(__file__).resolve().parent.parent
-LAUNCHER = REPO / "templates" / "myak-hook.sh"
+LAUNCHER = REPO / "myak" / "templates" / "myak-hook.sh"
 
 SUBCOMMANDS = [
     "hook", "index", "query", "backfill", "export", "mcp",
@@ -139,8 +139,12 @@ def test_export_passthrough_requires_vault(env, monkeypatch, capsys):
 
 
 def test_mcp_passthrough(env, monkeypatch, capsys):
-    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    from myak import mcp_server
+
+    ran = []
+    monkeypatch.setattr(mcp_server.mcp, "run", lambda *a, **k: ran.append(a))
     assert cli.main(["mcp"]) == 0
+    assert ran == [("stdio",)]
 
 
 def test_migrate_dry_run_and_real(env, capsys):
@@ -281,7 +285,7 @@ def test_install_hooks_missing_templates(env, monkeypatch, capsys):
 
 
 def test_hooks_template_shape():
-    data = json.loads((REPO / "templates" / "hooks.json").read_text())
+    data = json.loads((REPO / "myak" / "templates" / "hooks.json").read_text())
     assert set(data) == {"Stop", "SessionEnd", "UserPromptSubmit"}
     for groups in data.values():
         for g in groups:

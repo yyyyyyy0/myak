@@ -1,0 +1,16 @@
+// Syncthing ignore patterns for the myak database directory.
+// Copy to ~/.claude/memory/.stignore (the synced folder) and adapt.
+//
+// SQLite journal/WAL side files must never be synced: they are only valid
+// together with the exact database file on the machine that wrote them.
+*-journal
+*-wal
+*-shm
+//
+// NOT ignored on purpose: *.sync-conflict-* files. If Syncthing reports a
+// conflict for memory.db, look at the conflict copy before deleting it; it may
+// contain sessions indexed on the other machine.
+//
+// Machine-local data does NOT live in this folder and is never synced:
+// ~/.claude/myak-state/ holds state.db, backups/, the hook launcher (bin/) and
+// the recorded interpreter (venv-python). Do not add it to the synced folder.

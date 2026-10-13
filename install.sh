@@ -1,65 +1,83 @@
 #!/bin/bash
+# myak installer: uv tool + Claude Code plugin (D9/D11/D14).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SETTINGS="$HOME/.claude/settings.json"
 LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
+MYAK_SHIM="$HOME/.local/bin/myak"
+EXPORT_SHIM="$HOME/.local/bin/myak-export"
 
 echo "=== myak installer ==="
 echo ""
 
-# 1. pip install
-echo "[1/5] Installing myak..."
-pip install -e "$SCRIPT_DIR" --quiet
-echo "  Installed: $(which myak-index)"
-
-# 2. Merge hooks into settings.json
-echo "[2/5] Configuring Claude Code hooks..."
-if [ -f "$SETTINGS" ]; then
-    HOOKS_TEMPLATE="$SCRIPT_DIR/templates/hooks.json"
-
-    # Check if myak hooks already exist
-    if grep -q 'myak-index' "$SETTINGS" 2>/dev/null; then
-        echo "  Hooks already configured, skipping."
-    else
-        # Backup
-        cp "$SETTINGS" "$SETTINGS.bak"
-
-        # Merge Stop hook
-        jq '.hooks.Stop += [input.Stop[0]]' "$SETTINGS" "$HOOKS_TEMPLATE" > "$SETTINGS.tmp" \
-            && mv "$SETTINGS.tmp" "$SETTINGS"
-
-        # Merge UserPromptSubmit hook
-        if jq -e '.hooks.UserPromptSubmit' "$SETTINGS" > /dev/null 2>&1; then
-            jq '.hooks.UserPromptSubmit += [input.UserPromptSubmit[0]]' "$SETTINGS" "$HOOKS_TEMPLATE" > "$SETTINGS.tmp" \
-                && mv "$SETTINGS.tmp" "$SETTINGS"
-        else
-            jq '.hooks.UserPromptSubmit = [input.UserPromptSubmit[0]]' "$SETTINGS" "$HOOKS_TEMPLATE" > "$SETTINGS.tmp" \
-                && mv "$SETTINGS.tmp" "$SETTINGS"
-        fi
-
-        echo "  Hooks added to $SETTINGS (backup: $SETTINGS.bak)"
-    fi
+# 1. uv tool install
+echo "[1/6] Installing myak with uv..."
+if ! command -v uv >/dev/null 2>&1; then
+    echo "  ERROR: uv is required but not found." >&2
+    echo "  Install it: curl -LsSf https://astral.sh/uv/install.sh | sh   (or: brew install uv)" >&2
+    exit 1
+fi
+if [ "${MYAK_EDITABLE:-}" = "1" ]; then
+    echo "  WARNING: editable install; the clone at $SCRIPT_DIR must stay in place."
+    uv tool install --editable "$SCRIPT_DIR" --python 3.12 --force
 else
-    echo "  WARNING: $SETTINGS not found. Skipping hook setup."
-    echo "  See templates/hooks.json for manual configuration."
+    uv tool install "$SCRIPT_DIR" --python 3.12 --force
+fi
+if [ ! -x "$MYAK_SHIM" ]; then
+    MYAK_SHIM="$(command -v myak || true)"
+fi
+[ -n "$MYAK_SHIM" ] || { echo "  ERROR: myak shim not found after install (is ~/.local/bin on PATH? try: uv tool update-shell)" >&2; exit 1; }
+echo "  Installed: $MYAK_SHIM"
+
+# 2. Hook launcher (machine-local fallback used by settings.json hooks)
+echo "[2/6] Installing hook launcher..."
+"$MYAK_SHIM" install-hooks
+
+# 3. Claude Code plugin
+echo "[3/6] Claude Code plugin..."
+if command -v claude >/dev/null 2>&1; then
+    claude plugin marketplace add "$SCRIPT_DIR" || echo "  marketplace already added"
+    claude plugin install myak@myak || echo "  plugin already installed (try: claude plugin update myak@myak)"
+else
+    echo "  'claude' CLI not found. Run these when it is available:"
+    echo "    claude plugin marketplace add \"$SCRIPT_DIR\""
+    echo "    claude plugin install myak@myak"
 fi
 
-# 3. LaunchAgent (macOS only, optional)
-echo "[3/5] LaunchAgent setup..."
+# 4. Legacy settings.json hooks (the plugin supersedes them)
+echo "[4/6] Legacy settings.json hooks..."
+if [ "${MYAK_REMOVE_SETTINGS_HOOKS:-}" = "1" ]; then
+    "$MYAK_SHIM" migrate-settings --mode remove
+else
+    echo "  WARNING: legacy settings.json hooks were left in place. While they coexist"
+    echo "  with the plugin, UserPromptSubmit injects context TWICE."
+    echo "  Remove them with:  myak migrate-settings --mode remove      (preview: add --dry-run)"
+    echo "  Or re-run with MYAK_REMOVE_SETTINGS_HOOKS=1."
+fi
+
+# 5. LaunchAgent (macOS only, optional)
+echo "[5/6] LaunchAgent setup..."
 if [ "$(uname)" = "Darwin" ] && [ -n "${MYAK_OBSIDIAN_VAULT:-}" ]; then
-    PLIST_TEMPLATE="$SCRIPT_DIR/templates/com.myak.export.plist.template"
     PLIST_DEST="$LAUNCH_AGENTS/com.myak.export.plist"
-    EXPORT_BIN="$(which myak-export)"
+    LOG_DIR="$HOME/Library/Logs"
 
-    # Unload old if exists
-    launchctl unload "$PLIST_DEST" 2>/dev/null || true
-
-    sed -e "s|__MYAK_EXPORT_BIN__|$EXPORT_BIN|g" \
-        -e "s|__OBSIDIAN_VAULT__|$MYAK_OBSIDIAN_VAULT|g" \
-        "$PLIST_TEMPLATE" > "$PLIST_DEST"
-
-    launchctl load "$PLIST_DEST"
+    mkdir -p "$LAUNCH_AGENTS" "$LOG_DIR"
+    # plistlib escapes the vault path correctly (spaces, &, <, ...); sed did not.
+    EXPORT_SHIM="$EXPORT_SHIM" VAULT="$MYAK_OBSIDIAN_VAULT" PLIST_DEST="$PLIST_DEST" \
+        LOG_FILE="$LOG_DIR/myak-export.log" python3 -c '
+import os, plistlib
+data = {
+    "Label": "com.myak.export",
+    "ProgramArguments": [os.environ["EXPORT_SHIM"], "--vault", os.environ["VAULT"], "--since", "7"],
+    "StartCalendarInterval": {"Hour": 9, "Minute": 17},
+    "StandardOutPath": os.environ["LOG_FILE"],
+    "StandardErrorPath": os.environ["LOG_FILE"],
+}
+with open(os.environ["PLIST_DEST"], "wb") as f:
+    plistlib.dump(data, f)
+'
+    launchctl bootout "gui/$(id -u)" "$PLIST_DEST" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$PLIST_DEST"
     echo "  LaunchAgent installed: daily 9:17 AM export to $MYAK_OBSIDIAN_VAULT"
 else
     if [ "$(uname)" != "Darwin" ]; then
@@ -70,10 +88,12 @@ else
     fi
 fi
 
-# 4. Shell alias
-echo "[4/5] Shell alias..."
+# 6. Shell alias
+echo "[6/6] Shell alias..."
 ZSHRC="$HOME/.zshrc"
-if [ -f "$ZSHRC" ] && ! grep -q 'claude-reload' "$ZSHRC" 2>/dev/null; then
+if [ "${MYAK_SHELL_ALIAS:-}" != "1" ]; then
+    echo "  Skipped (opt in with MYAK_SHELL_ALIAS=1 to add the claude-reload alias)."
+elif [ -f "$ZSHRC" ] && ! grep -q 'claude-reload' "$ZSHRC" 2>/dev/null; then
     cat >> "$ZSHRC" << 'ALIAS'
 
 # myak: reload Claude Code settings across all tmux panes
@@ -84,10 +104,11 @@ else
     echo "  Alias already exists or no .zshrc, skipping."
 fi
 
-# 5. Initial backfill
-echo "[5/5] Running initial backfill..."
-myak-backfill
+echo ""
+echo "Existing database? Preview the schema migration first:  myak migrate --dry-run"
+echo "Running initial backfill..."
+"$MYAK_SHIM" backfill || echo "WARN: backfill failed; run 'myak backfill' later"
 
 echo ""
 echo "=== Done ==="
-echo "Commands: myak-index, myak-query, myak-backfill, myak-export"
+echo "Commands: myak {hook,backfill,reindex,migrate,migrate-settings,mcp,...}, myak-query, myak-export"

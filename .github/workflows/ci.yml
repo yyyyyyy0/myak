@@ -6,21 +6,59 @@ on:
   pull_request:
     branches: [main]
 
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+permissions:
+  contents: read
 
-      - uses: actions/setup-python@v5
+jobs:
+  matrix:
+    name: test (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.12", "3.13", "3.14"]
+        include:
+          - os: macos-latest
+            python-version: "3.12"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
-          python-version: "3.10"
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: uv sync --locked --group dev
+
+      - name: SQLite version
+        run: uv run python -c "import sqlite3;print(sqlite3.sqlite_version)"
 
       - name: Lint
-        run: ruff check .
+        run: uv run ruff check .
 
       - name: Test
-        run: pytest
+        run: uv run pytest
+
+      - name: ShellCheck
+        if: runner.os == 'Linux' && matrix.python-version == '3.12'
+        run: shellcheck hooks/run.sh myak/templates/myak-hook.sh install.sh uninstall.sh
+
+      - name: Packaging smoke test
+        if: runner.os == 'Linux' && matrix.python-version == '3.12'
+        run: |
+          uv build --wheel
+          unzip -l dist/*.whl | grep -q 'myak/templates/hooks.json'
+
+  # Aggregate gate: branch protection requires a check named exactly "test".
+  test:
+    name: test
+    needs: [matrix]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any matrix job did not succeed
+        run: |
+          echo "matrix result: ${{ needs.matrix.result }}"
+          test "${{ needs.matrix.result }}" = "success"
