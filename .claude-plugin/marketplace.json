@@ -1,0 +1,11 @@
+{
+  "name": "myak",
+  "owner": { "name": "yyyyyyy0" },
+  "plugins": [
+    {
+      "name": "myak",
+      "source": "./",
+      "description": "Persistent memory for Claude Code sessions (hooks, MCP server, recall skill)."
+    }
+  ]
+}

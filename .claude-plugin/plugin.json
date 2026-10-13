@@ -1,0 +1,10 @@
+{
+  "name": "myak",
+  "displayName": "myak",
+  "version": "0.3.0",
+  "description": "Persistent memory for Claude Code: indexes sessions into SQLite, injects relevant past context, and exposes myak_search / myak_save over MCP.",
+  "author": { "name": "yyyyyyy0" },
+  "repository": "https://github.com/yyyyyyy0/myak",
+  "license": "MIT",
+  "keywords": ["memory", "sqlite", "mcp", "hooks", "context"]
+}

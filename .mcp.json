@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "myak": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/hooks/run.sh",
+      "args": ["mcp"]
+    }
+  }
+}
