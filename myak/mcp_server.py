@@ -1,10 +1,12 @@
 """myak MCP server — expose memory search and save to Claude Desktop."""
 
+import hashlib
 import json
 import sys
 from datetime import datetime, timezone
 
 from myak.config import ensure_memory_dir, get_connection
+from myak.db import require_current
 from myak.indexer import init_db
 from myak.query import format_plain, search
 
@@ -26,29 +28,41 @@ def save_memory(content, role="assistant", session_id=None):
     conn = get_connection()
     try:
         init_db(conn)
+        if not require_current(conn):
+            return {
+                "saved": False,
+                "reason": "Database schema is not current; run `myak migrate`",
+            }
 
-        existing = conn.execute(
-            "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
-        ).fetchone()
-        if not existing:
+        timestamp = now.isoformat()
+        stored = content[:4000]
+        uuid = "save:" + hashlib.sha1(content.encode("utf-8")).hexdigest()[:16]
+        conn.execute("BEGIN IMMEDIATE")
+        try:
             conn.execute(
                 "INSERT INTO sessions "
                 "(session_id, project_path, started_at, segment_count, indexed_at) "
-                "VALUES (?, ?, ?, 0, ?)",
-                (session_id, "claude-desktop", now.isoformat(), now.isoformat()),
+                "VALUES (?, ?, ?, 0, ?) ON CONFLICT(session_id) DO NOTHING",
+                (session_id, "claude-desktop", timestamp, timestamp),
             )
-
-        timestamp = now.isoformat()
-        conn.execute(
-            "INSERT INTO segments (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
-            (session_id, role, content[:4000], timestamp),
-        )
-        conn.execute(
-            "UPDATE sessions SET segment_count = segment_count + 1, "
-            "ended_at = ? WHERE session_id = ?",
-            (timestamp, session_id),
-        )
-        conn.commit()
+            conn.execute(
+                "INSERT INTO segments "
+                "(session_id, role, content, timestamp, uuid, agent_id) "
+                "VALUES (?, ?, ?, ?, ?, '') "
+                "ON CONFLICT(session_id, agent_id, uuid) WHERE uuid IS NOT NULL DO NOTHING",
+                (session_id, role, stored, timestamp, uuid),
+            )
+            conn.execute(
+                "UPDATE sessions SET segment_count = "
+                "(SELECT COUNT(*) FROM segments WHERE session_id = ?), ended_at = ? "
+                "WHERE session_id = ?",
+                (session_id, timestamp, session_id),
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
         return {"saved": True, "session_id": session_id}
     except Exception as e:
         return {"saved": False, "reason": str(e)}
