@@ -7,6 +7,7 @@ from myak.config import SUBAGENT_WEIGHT
 from myak.query import search
 
 SCHEMA = """
+PRAGMA user_version=1;
 CREATE TABLE sessions (
     session_id TEXT PRIMARY KEY, project_path TEXT, started_at TEXT,
     ended_at TEXT, segment_count INTEGER DEFAULT 0, indexed_at TEXT);
