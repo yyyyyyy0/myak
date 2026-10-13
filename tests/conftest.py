@@ -48,3 +48,6 @@ def _isolated_state_dir(tmp_path_factory, monkeypatch):
     state_dir = tmp_path_factory.mktemp("autostate") / "myak-state"
     monkeypatch.setattr(myak.config, "STATE_DIR", state_dir)
     monkeypatch.setattr(myak.config, "STATE_DB_PATH", state_dir / "state.db")
+    monkeypatch.setattr(myak.config, "VEC_DB_PATH", state_dir / "memory.vec.db")
+    monkeypatch.setattr(myak.config, "MODELS_DIR", state_dir / "models")
+    monkeypatch.delenv("MYAK_DISABLE_VEC", raising=False)

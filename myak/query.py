@@ -4,7 +4,6 @@ import argparse
 import json
 import math
 import re
-import sqlite3
 import sys
 from datetime import datetime, timezone
 
@@ -15,15 +14,11 @@ from myak.config import (
     HOOK_SNIPPET_CHARS,
     MAX_CODEX_CHARS,
     MAX_RESULTS,
-    MAX_SNIPPET_CHARS,
     MIN_ABSOLUTE_SCORE,
     MIN_MATCHING_TOKENS,
     MIN_RELATIVE_SCORE,
-    SUBAGENT_WEIGHT,
     TOKEN_MATCH_GUARD,
-    get_connection,
 )
-from myak.db import CURRENT_VERSION, schema_version
 
 
 def time_decay_score(timestamp_str, base_score):
@@ -108,54 +103,13 @@ def filter_results(results, tokens, *, hook_mode=False):
     return filtered
 
 
-def search(query, max_results=MAX_RESULTS):
-    """FTS5 で検索し、時間減衰でリランキング。"""
+def search(query, max_results=MAX_RESULTS, use_vec=False):
+    """検索 (薄いラッパー)。既定は FTS のみ (hook 経路)。use_vec=True でハイブリッド。"""
     if not DB_PATH.exists():
         return []
+    from myak.search import hybrid_search
 
-    fts_query = tokenize_query(query)
-
-    conn = get_connection()
-    try:
-        if schema_version(conn) < CURRENT_VERSION:
-            print("myak: schema outdated, run `myak migrate`", file=sys.stderr)
-            return []
-        rows = conn.execute(
-            """
-            SELECT s.role, s.content, s.timestamp, s.session_id, se.project_path,
-                   rank, s.agent_type
-            FROM segments_fts f
-            JOIN segments s ON s.id = f.rowid
-            JOIN sessions se ON se.session_id = s.session_id
-            WHERE segments_fts MATCH ?
-            ORDER BY rank
-            LIMIT ?
-            """,
-            (fts_query, max_results * 3),
-        ).fetchall()
-    except sqlite3.OperationalError:  # FTS 構文エラーなど
-        return []
-    finally:
-        conn.close()
-
-    results = []
-    for row in rows:
-        role, content, timestamp, session_id, project, fts_rank, agent_type = row
-        score = time_decay_score(timestamp, abs(fts_rank))
-        if agent_type is not None:
-            score *= SUBAGENT_WEIGHT
-        results.append({
-            "role": role,
-            "content": content[:MAX_SNIPPET_CHARS],
-            "timestamp": timestamp[:10] if timestamp else "",
-            "session_id": session_id[:8],
-            "project": project or "",
-            "score": score,
-            "agent_type": agent_type,
-        })
-
-    results.sort(key=lambda r: r["score"], reverse=True)
-    return results[:max_results]
+    return hybrid_search(query, max_results, use_vec=use_vec)
 
 
 def format_plain(results, query):
@@ -279,6 +233,10 @@ def main(argv=None):
     parser.add_argument("--hook", action="store_true", help="Hook mode: JSON output")
     parser.add_argument("--codex", action="store_true", help="Codex mode: compact output")
     parser.add_argument("--limit", type=int, default=MAX_RESULTS, help="Max results")
+    parser.add_argument(
+        "--hybrid", action=argparse.BooleanOptionalAction, default=None,
+        help="Use vector search too when myak[vec] is available (default: on)",
+    )
     args = parser.parse_args(argv)
 
     query = " ".join(args.query) if args.query else ""
@@ -300,7 +258,11 @@ def main(argv=None):
         print("Query too short (min 3 chars)", file=sys.stderr)
         sys.exit(1)
 
-    results = search(query, args.limit)
+    from myak import config
+
+    if args.hybrid is None:
+        args.hybrid = not config.vec_disabled()
+    results = search(query, args.limit, use_vec=args.hybrid)
 
     if args.codex:
         output = format_codex(results, query)
