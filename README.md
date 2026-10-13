@@ -2,23 +2,22 @@
 
 > **myak** — from Japanese **脈** (myaku), meaning "pulse" or "vein". As in 文脈 (context) and 脈絡 (coherence) — the threads of meaning that connect conversations over time.
 
-Persistent memory for Claude Code. Automatically indexes session transcripts into SQLite FTS5 and makes past conversations searchable — across projects, across sessions.
+Persistent memory for Claude Code. Indexes session transcripts into SQLite FTS5 and makes past conversations searchable across projects and sessions.
 
 ## What it does
 
-1. **Auto-index** — A Claude Code hook runs `myak-index` at the end of every session, extracting conversation segments into a local SQLite database with full-text search (FTS5 trigram).
-2. **Auto-recall** — On each prompt, a `UserPromptSubmit` hook searches memory for related context and injects it as additional context via `additionalContext`. Results are filtered by relevance threshold and deduplicated per session, so only meaningful matches reach Claude.
-3. **Manual search** — `myak-query` lets you search memory from the terminal.
-4. **Backfill** — `myak-backfill` indexes all existing session transcripts at once.
-5. **Obsidian export** — `myak-export` turns your session history into Markdown notes for Obsidian, organized by project.
-6. **MCP server** — `myak-mcp` exposes `myak_search` and `myak_save` tools over the Model Context Protocol for use with Claude Desktop.
+1. **Auto-index.** `Stop` indexes the transcript after every turn, incrementally. `SessionEnd` does a final flush. Subagent transcripts are indexed too.
+2. **Auto-recall.** `UserPromptSubmit` searches memory and injects related context via `additionalContext`.
+3. **Project summary.** `SessionStart` (`startup|clear|compact`) injects the most recent sessions of the current project.
+4. **MCP tools.** `myak_search` and `myak_save`, for Claude Code and Claude Desktop.
+5. **Manual search.** `myak query` from the terminal.
+6. **Obsidian export.** `myak export` writes Markdown notes per project.
 
 ## Requirements
 
-- Python 3.10+
-- Claude Code (with `~/.claude/settings.json` and `~/.claude/projects/`)
-- `jq` (for hook installation)
-- macOS recommended (LaunchAgent support for scheduled Obsidian export)
+- Python 3.12+, managed by [uv](https://docs.astral.sh/uv/)
+- Claude Code with plugin support (`claude plugin ...`). The exact minimum version is not verified here; use a current release.
+- macOS is optional: a LaunchAgent can run the Obsidian export daily.
 
 ## Install
 
@@ -28,174 +27,213 @@ cd myak
 ./install.sh
 ```
 
-The installer does 5 things:
+The installer:
 
-1. `pip install -e .` — installs myak and its CLI commands
-2. Adds `Stop` and `UserPromptSubmit` hooks to `~/.claude/settings.json` (backs up first)
-3. Optionally sets up a macOS LaunchAgent for daily Obsidian export
-4. Adds a `claude-reload` shell alias for reloading settings across tmux panes
-5. Runs an initial backfill of all existing sessions
+1. Runs `uv tool install` (shim at `~/.local/bin/myak`).
+2. Runs `myak install-hooks` (machine-local hook launcher).
+3. Adds the repo as a plugin marketplace and installs `myak@myak`.
+4. Optionally removes legacy `settings.json` hooks.
+5. Optionally installs a LaunchAgent for Obsidian export (macOS).
+6. Optionally adds a `claude-reload` shell alias.
+7. Runs an initial `myak backfill`.
 
-To enable Obsidian export during install:
+Switches:
 
-```bash
-MYAK_OBSIDIAN_VAULT=~/path/to/vault ./install.sh
-```
+| Variable | Effect |
+|---|---|
+| `MYAK_EDITABLE=1` | Editable install. The clone must stay in place. |
+| `MYAK_REMOVE_SETTINGS_HOOKS=1` | Run `myak migrate-settings --mode remove`. |
+| `MYAK_SHELL_ALIAS=1` | Add the `claude-reload` alias to `~/.zshrc`. |
+| `MYAK_OBSIDIAN_VAULT=<path>` | Install a daily 9:17 export LaunchAgent. |
 
-## CLI commands
+If both the plugin and legacy `settings.json` hooks are active, `UserPromptSubmit` injects context twice. Remove the legacy hooks.
 
-### `myak-query <query>`
-
-Search past conversations.
-
-```bash
-myak-query "authentication flow"
-myak-query "デプロイ手順"
-```
-
-Options:
-- `--limit N` — max results (default: 5)
-- `--hook` — hook mode, reads query from stdin JSON, outputs JSON for Claude
-- `--codex` — compact output for Codex prompt injection
-
-### `myak-index`
-
-Index a session transcript.
+### Manual install
 
 ```bash
-# From Claude Code Stop hook (reads JSON from stdin)
-myak-index
-
-# From CLI
-myak-index --file ~/.claude/projects/some-project/abc123.jsonl
-myak-index --session abc123 --project some-project
+uv tool install . --python 3.12
+claude plugin marketplace add /path/to/myak
+claude plugin install myak@myak
 ```
 
-### `myak-backfill [project]`
+The plugin ships the hooks, the MCP server (`.mcp.json`) and the `myak-recall` skill.
 
-Bulk-index all existing session transcripts.
+If you prefer `settings.json` hooks over the plugin, run `myak install-hooks`. It writes the launcher and prints a snippet to paste. Do not use both.
+
+## Upgrading from 0.1 / 0.2
+
+Short version:
 
 ```bash
-myak-backfill              # all projects
-myak-backfill myproject    # filter by project slug (partial match)
+myak migrate --dry-run
+myak migrate
+myak migrate-settings --mode remove --dry-run
+myak migrate-settings --mode remove
+myak clean-legacy --dry-run
+myak clean-legacy
 ```
 
-### `myak-export`
+Hooks go quiet on an old database until you run `myak migrate`. Syncthing users: migrate on one machine while the others are idle. Full steps in [docs/MIGRATION.md](docs/MIGRATION.md).
 
-Export sessions to Obsidian vault as Markdown.
+## CLI reference
 
-```bash
-myak-export --vault ~/obsidian/vault
-myak-export --vault ~/obsidian/vault --since 7     # last 7 days
-myak-export --vault ~/obsidian/vault --project foo  # filter by project
-```
+All commands are subcommands of `myak`.
 
-### `myak-mcp`
+| Command | Purpose |
+|---|---|
+| `myak hook {stop,session-end,session-start,prompt}` | Hook handler. Reads JSON on stdin. Always exits 0. |
+| `myak index [--file F] [--session S] [--project P] [--final] [--embed]` | Index one transcript. |
+| `myak query [--limit N] [--hook] [--codex] [--hybrid\|--no-hybrid] <query>` | Search. `--hook` emits hook JSON, `--codex` compact text. Hybrid is on by default when `myak[vec]` is available. |
+| `myak backfill [project] [--rebuild-fts]` | Index all transcripts, including subagents. `project` is a partial slug match. |
+| `myak export [--vault V] [--since DAYS] [--project P]` | Export to Obsidian. |
+| `myak mcp` | MCP server over stdio. |
+| `myak migrate [--dry-run]` | Migrate the schema. Explicit only. |
+| `myak reindex --full` | Reset cursors and re-run backfill. `--full` is required. |
+| `myak install-hooks` | Write the launcher and print a settings snippet. |
+| `myak migrate-settings --mode {rewrite,remove} [--dry-run] [--path P] [--launcher L]` | Edit myak entries in `settings.json`. Writes a `.bak`. |
+| `myak clean-legacy [--dry-run]` | Apply noise filters to old rows without uuid. |
+| `myak embed [--limit N] [--model M]` | Embed pending segments (needs `myak[vec]`). |
 
-Run the MCP server (stdio transport). Intended for use with Claude Desktop.
+Legacy aliases, kept for one release: `myak-index`, `myak-query`, `myak-backfill`, `myak-export`, `myak-mcp`.
 
-Add to your Claude Desktop config (`claude_desktop_config.json`):
+### MCP server
+
+With the plugin, the server starts automatically. For Claude Desktop, use the uv shim:
 
 ```json
 {
   "mcpServers": {
-    "myak": {
-      "command": "myak-mcp"
-    }
+    "myak": { "command": "~/.local/bin/myak-mcp" }
   }
 }
 ```
 
-Exposes two tools:
-- **myak_search** — search past conversation memory
-- **myak_save** — persist important information to long-term memory
+Use the absolute path if your client does not expand `~`. Tools: `myak_search`, `myak_save`.
 
 ## How it works
 
 ### Storage
 
-All data lives in `~/.claude/memory/memory.db` (SQLite). Two tables:
+| Path | Synced? | Content |
+|---|---|---|
+| `~/.claude/memory/memory.db` | yes | The only file to sync. Sessions, segments, FTS5 (trigram). |
+| `~/.claude/myak-state/` | no | Machine-local state. |
+| `  state.db` | no | Incremental cursors. |
+| `  hook.log` | no | Hook log (rotating, 0600). |
+| `  bin/`, `venv-python` | no | Launcher and recorded interpreter. |
+| `  backups/` | no | Pre-migration backups (newest 3). |
+| `  models/` | no | Embedding model cache. |
+| `  memory.vec.db` | no | Vector cache. Rebuildable. |
 
-- **sessions** — one row per conversation session (ID, project, timestamps, segment count)
-- **segments** — individual conversation turns (role, content, timestamp), linked to sessions
-- **segments_fts** — FTS5 virtual table with trigram tokenizer for substring search
+SQLite runs with `journal_mode=DELETE`, so there are no `-wal`/`-shm` files.
 
-### Search ranking
+### Schema versions
 
-Results are ranked by FTS5 relevance score, then re-ranked with exponential time decay (half-life: 30 days). Recent conversations surface higher.
+Tracked with `PRAGMA user_version`.
 
-### Hooks
+- **v0** — original schema.
+- **v1** — adds `uuid`, `agent_id`, `agent_type` on segments, `cwd` on sessions, and a partial unique index `(session_id, agent_id, uuid)`.
+- **v2** — adds the `sessions(cwd, ended_at)` index for SessionStart.
 
-The installer adds two hooks to `~/.claude/settings.json`:
+Hooks never migrate. On an older schema they log once and exit 0. Code refuses to open a newer schema.
 
-```json
-{
-  "hooks": {
-    "Stop": [{
-      "matcher": "*",
-      "hooks": [{ "type": "command", "command": "myak-index", "async": true }]
-    }],
-    "UserPromptSubmit": [{
-      "matcher": "*",
-      "hooks": [{ "type": "command", "command": "myak-query --hook" }]
-    }]
-  }
-}
+### Indexing
+
+- Dedupe key is `uuid` (inserts use `ON CONFLICT DO NOTHING`). Records without a uuid get a synthetic key from file name and offset.
+- Cursors (path, offset, size, first-4KB hash) live in `state.db`, not in the synced DB.
+- A file is fully rescanned when there is no cursor, the fingerprint changed, the offset exceeds the size, or the byte before the offset is not `\n`. Rescans add no duplicates.
+- An unterminated last line waits for the next run. `SessionEnd`, `index` and `backfill` accept it if it parses.
+- Noise is dropped: system reminders, command tags, meta records, tool-result-only turns. `last_assistant_message` is not stored.
+- Subagent transcripts are stored under the parent session with `agent_id` and `agent_type`.
+
+### Hook timeouts
+
+`SessionEnd` has a 1.5 s default budget, and plugin hooks cannot raise it. So `myak hook session-end` does no indexing itself. It starts a detached `index --final --embed` process and exits in under 200 ms. Set `CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS` if you want to raise the budget for settings-based hooks. Plugin hooks ignore per-hook timeouts for this event.
+
+`Stop` runs async (60 s). `UserPromptSubmit` has 10 s, `SessionStart` 5 s.
+
+## Recall quality
+
+Hook recall filters aggressively:
+
+- Prompts starting with `/` are skipped.
+- Absolute score floor and a relative floor (35% of the best hit).
+- Queries with 3+ tokens need at least 2 matching tokens.
+- At most one hit per session. Up to 3 hits, 220 chars each.
+- Time decay (half-life 30 days). Subagent hits are weighted by `SUBAGENT_WEIGHT` (0.5).
+- Injected text is wrapped in `<past-memory untrusted="true">` with escaping. It is data, not instructions.
+
+`SessionStart` lists up to 5 recent sessions of the current project (title and date), capped at 1500 chars. Subagent rows are excluded and control characters are stripped.
+
+## Hybrid search (optional)
+
+Adds vector search on top of FTS5, fused with RRF.
+
+```bash
+uv tool install 'myak[vec]' --python 3.12
+# or, for an existing install:
+uv tool install myak --with 'myak[vec]' --force
+myak embed
 ```
 
-- **Stop** — reads `transcript_path` from hook input and indexes the session transcript
-- **UserPromptSubmit** — reads `prompt` from hook input, searches memory, and returns matching context via `additionalContext`
-
-### Recall quality
-
-Hook recall applies multiple filters to reduce noise:
-
-- **Absolute score threshold** — drops results with FTS5 score below `MIN_ABSOLUTE_SCORE`
-- **Relative score threshold** — drops results scoring less than 35% of the best result
-- **Token match guard** — for queries with 3+ tokens, requires at least 2 tokens to match
-- **Session deduplication** — returns at most 1 result per session in hook mode
-- **Compact payload** — hook mode returns up to 3 results (vs 5 in CLI mode), each truncated to 220 chars
+- Model: `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` via fastembed (384-dim).
+- Download is about 0.22 GB and happens only when you run `myak embed`. Hooks never download anything.
+- Vectors live in `memory.vec.db`. It is a derived cache: local, not synced, rebuildable. A model change rebuilds it.
+- The `UserPromptSubmit` hook stays FTS-only. Hybrid applies to `myak query`, MCP and backfill. `SessionEnd` embeds after indexing.
+- Without the extra, or if the model is missing, search falls back to FTS-only.
+- Kill switch: `MYAK_DISABLE_VEC=1`.
 
 ## Cross-machine sync
 
-myak uses SQLite with `journal_mode=DELETE`, so the database is always a single self-contained file (`~/.claude/memory/memory.db`) with no sidecar files (`.db-wal`, `.db-shm`).
+Sync only `~/.claude/memory/` (just `memory.db`). Never sync `~/.claude/myak-state/`.
 
-This means you can sync your memory across machines (e.g., Mac ↔ Windows) by syncing the `~/.claude/memory/` directory with any file sync tool:
+Use [Syncthing](https://syncthing.net/). Copy `.stignore.example` to `~/.claude/memory/.stignore` on each machine. `.stignore` is per device. It ignores `*-journal`, `*-wal`, `*-shm`.
 
-- [Syncthing](https://syncthing.net/) (recommended)
-- iCloud Drive / OneDrive (symlink `~/.claude/memory/` into your cloud folder)
-- rsync / manual copy
+Caveats:
 
-Both machines share the same conversation history and recall results automatically.
+- The DB is synced as a whole file. Writes on two machines at once can produce a `*.sync-conflict-*` copy. Do not delete it blindly; it may hold sessions only the other machine indexed.
+- Per-turn indexing writes the DB more often than the old per-session indexing, so conflicts are likelier. Avoid running two machines at the same time.
+- Per-machine DBs and uuid merge are out of scope.
+- Migrate on one machine only (see [docs/MIGRATION.md](docs/MIGRATION.md)).
 
-> **Note:** Avoid using both machines simultaneously for heavy write operations (e.g., running `myak-backfill` on both at once). Normal usage (sessions ending on one machine at a time) is safe.
+## Coexistence with Claude Code auto memory (MEMORY.md)
+
+They do different jobs.
+
+| | MEMORY.md (auto memory) | myak |
+|---|---|---|
+| Content | Curated, small notes | Large archive of past conversations |
+| Loading | Always loaded at session start | On demand: hook injection, MCP search |
+| Best for | Durable preferences and rules | "What did we decide / how did we fix X" |
+
+Guidance:
+
+- Put stable rules and preferences in MEMORY.md. Do not copy them into myak, and do not mirror chat history into MEMORY.md.
+- Use `myak_save` for facts that are useful but too specific or too bulky for MEMORY.md.
+- Token cost: MEMORY.md is paid every session. myak costs tokens only when a hook injects (at most 3 short hits per prompt, up to 1500 chars at session start) or when a tool is called.
+- If a fact appears in both, the always-loaded one wins. Remove the duplicate from myak's side by not saving it.
 
 ## Configuration
 
-| Environment variable | Default | Description |
+| Variable | Default | Description |
 |---|---|---|
 | `CLAUDE_DIR` | `~/.claude` | Claude Code config directory |
-| `MYAK_DIR` | `~/.claude/memory` | Database and memory directory |
-| `MYAK_OBSIDIAN_VAULT` | (none) | Obsidian vault path for export |
+| `MYAK_DIR` | `$CLAUDE_DIR/memory` | Synced DB directory |
+| `MYAK_STATE_DIR` | `$CLAUDE_DIR/myak-state` | Machine-local state |
+| `MYAK_OBSIDIAN_VAULT` | (none) | Default vault for export; enables the LaunchAgent in `install.sh` |
+| `MYAK_BIN` | (none) | Explicit `myak` binary for the hook launcher |
+| `MYAK_DISABLE_VEC` | (unset) | `1` disables vector search |
+| `CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS` | Claude Code default (1500) | Claude Code's SessionEnd budget. Not read by myak. |
+
+The launcher resolves the binary in this order: `$MYAK_BIN`, `~/.local/bin/myak`, the recorded venv python, `myak` on PATH. It never uses `uv tool run`.
 
 ## Uninstall
 
 ```bash
-pip uninstall myak
+./uninstall.sh
 ```
 
-Then remove the myak hooks from `~/.claude/settings.json` (search for `myak-index` and `myak-query`) and optionally:
-
-```bash
-# Remove LaunchAgent
-launchctl unload ~/Library/LaunchAgents/com.myak.export.plist
-rm ~/Library/LaunchAgents/com.myak.export.plist
-
-# Remove database
-rm -rf ~/.claude/memory/memory.db
-
-# Remove shell alias from ~/.zshrc
-```
+Removes settings hooks, the plugin and marketplace, the LaunchAgent, the legacy launcher and the uv tool. Your data is not deleted: `~/.claude/memory/` and `~/.claude/myak-state/` stay.
 
 ## License
 
