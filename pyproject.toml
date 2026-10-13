@@ -10,6 +10,9 @@ requires-python = ">=3.12"
 license = "MIT"
 dependencies = ["mcp>=2.3,<3"]
 
+[project.optional-dependencies]
+vec = ["sqlite-vec>=0.1.6", "fastembed>=0.5"]
+
 [tool.setuptools.packages.find]
 include = ["myak*"]
 
@@ -30,6 +33,7 @@ dev = [
     "pytest-cov>=7.0",
     "coverage[toml]>=7.0",
     "ruff>=0.4",
+    "sqlite-vec>=0.1.6",
 ]
 
 [tool.pytest.ini_options]

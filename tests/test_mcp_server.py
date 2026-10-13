@@ -37,7 +37,7 @@ def test_save_then_search_and_duplicate(mem):
 def test_search_limit_is_clamped(mem, monkeypatch):
     seen = []
     monkeypatch.setattr(
-        mcp_server, "search", lambda q, max_results: seen.append(max_results) or []
+        mcp_server, "search", lambda q, max_results, **kw: seen.append(max_results) or []
     )
     myak_search("abc", limit=0)
     myak_search("abc", limit=500)
@@ -84,7 +84,7 @@ def test_search_query_is_stripped_before_length_check():
 
 
 def test_search_failure_is_sanitized(mem, monkeypatch, caplog):
-    def boom(q, max_results):
+    def boom(q, max_results, **kw):
         raise RuntimeError("/secret/path/memory.db is locked")
 
     monkeypatch.setattr(mcp_server, "search", boom)

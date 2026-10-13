@@ -12,6 +12,11 @@ PROJECTS_DIR = CLAUDE_DIR / "projects"
 # 機械ローカルの状態 (インクリメンタル索引のカーソル)。同期対象外。
 STATE_DIR = Path(os.environ.get("MYAK_STATE_DIR", CLAUDE_DIR / "myak-state"))
 STATE_DB_PATH = STATE_DIR / "state.db"
+# ベクトル索引 (派生キャッシュ。機械ローカル・同期対象外・再構築可能)
+VEC_DB_PATH = STATE_DIR / "memory.vec.db"
+MODELS_DIR = STATE_DIR / "models"
+# fastembed 非対応の multilingual-e5-small の代わりに、対応済みの多言語 384 次元小型モデルを使う
+VEC_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 # Obsidian vault は環境変数 or CLI 引数で指定
 OBSIDIAN_VAULT = os.environ.get("MYAK_OBSIDIAN_VAULT", "")
@@ -36,6 +41,11 @@ MIN_RELATIVE_SCORE = 0.35  # best score 比
 MIN_ABSOLUTE_SCORE = 0.03
 MIN_MATCHING_TOKENS = 2    # TOKEN_MATCH_GUARD 以上のトークン数で適用
 TOKEN_MATCH_GUARD = 3
+
+
+def vec_disabled():
+    """MYAK_DISABLE_VEC=1 でベクトル検索を無効化するキルスイッチ。"""
+    return os.environ.get("MYAK_DISABLE_VEC", "") not in ("", "0")
 
 
 def home_parts():

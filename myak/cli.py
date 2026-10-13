@@ -42,6 +42,10 @@ def build_parser():
     re = sub.add_parser("reindex", help="Reset cursors and re-run backfill")
     re.add_argument("--full", action="store_true", help="Required: confirm a full reindex")
 
+    em = sub.add_parser("embed", help="Embed pending segments for hybrid search (needs myak[vec])")
+    em.add_argument("--limit", type=int, default=None, help="Max segments to embed")
+    em.add_argument("--model", default=None, help="Embedding model id (fastembed)")
+
     sub.add_parser("install-hooks", help="Install the hook launcher and print settings snippet")
 
     ms = sub.add_parser(
@@ -203,6 +207,10 @@ def main(argv=None):
         return cleanup.run(args.dry_run)
     if args.command == "reindex":
         return cmd_reindex(args.full)
+    if args.command == "embed":
+        from myak import vec
+
+        return vec.run_embed(limit=args.limit, model=args.model)
     if args.command == "install-hooks":
         return cmd_install_hooks()
     if args.command == "migrate-settings":

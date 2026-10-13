@@ -10,6 +10,21 @@ from myak.db import DatabaseLocked, require_current
 from myak.indexer import index_transcript_tree, init_db
 
 
+def _embed_after_index(conn):
+    """vec が使えれば未埋め込み segment を埋め込む。失敗は警告のみ。"""
+    from myak import vec
+
+    if config.vec_disabled():
+        return
+    try:
+        n = vec.embed_pending(conn, vec.default_embedder())
+        print(f"Embedded {n} segments")
+    except vec.VecUnavailable as e:
+        print(f"Vector embedding skipped: {e}")  # モデル取得は `myak embed` で
+    except Exception as e:  # noqa: BLE001
+        print(f"warning: embedding failed: {e}", file=sys.stderr)
+
+
 def backfill(project_filter=None, rebuild_fts=False):
     """全 transcript (サブエージェント含む) をインデックスする。終了コードを返す。"""
     ensure_memory_dir()
@@ -62,6 +77,8 @@ def backfill(project_filter=None, rebuild_fts=False):
         if rebuild_fts:
             conn.execute("INSERT INTO segments_fts(segments_fts) VALUES('rebuild')")
             print("FTS index rebuilt")
+
+        _embed_after_index(conn)
 
         elapsed = time.time() - start
         print("\n--- Backfill complete ---")
