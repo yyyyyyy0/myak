@@ -92,7 +92,7 @@ All commands are subcommands of `myak`.
 | `myak install-hooks` | Write the launcher and print a settings snippet. |
 | `myak migrate-settings --mode {rewrite,remove} [--dry-run] [--path P] [--launcher L]` | Edit myak entries in `settings.json`. Writes a `.bak`. |
 | `myak clean-legacy [--dry-run]` | Apply noise filters to old rows without uuid. |
-| `myak embed [--limit N] [--model M]` | Embed pending segments (needs `myak[vec]`). |
+| `myak embed [--limit N] [--model M] [--rebuild]` | Embed pending segments (needs `myak[vec]`). `--model` accepts known models only; switching an existing index to another model requires `--rebuild`. |
 
 Legacy aliases, kept for one release: `myak-index`, `myak-query`, `myak-backfill`, `myak-export`, `myak-mcp`.
 
@@ -143,7 +143,7 @@ Hooks never migrate. On an older schema they log once and exit 0. Code refuses t
 - Cursors (path, offset, size, first-4KB hash) live in `state.db`, not in the synced DB.
 - A file is fully rescanned when there is no cursor, the fingerprint changed, the offset exceeds the size, or the byte before the offset is not `\n`. Rescans add no duplicates.
 - An unterminated last line waits for the next run. `SessionEnd`, `index` and `backfill` accept it if it parses.
-- Noise is dropped: system reminders, command tags, meta records, tool-result-only turns. `last_assistant_message` is not stored.
+- Noise is dropped: system reminders, command tags (including `local-command-caveat`), meta records, tool-result-only turns. `last_assistant_message` is not stored.
 - Subagent transcripts are stored under the parent session with `agent_id` and `agent_type`.
 
 ### Hook timeouts
@@ -178,10 +178,13 @@ myak embed
 
 - Model: `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` via fastembed (384-dim).
 - Download is about 0.22 GB and happens only when you run `myak embed`. Hooks never download anything.
-- Vectors live in `memory.vec.db`. It is a derived cache: local, not synced, rebuildable. A model change rebuilds it.
+- Vectors live in `memory.vec.db`. It is a derived cache: local, not synced, rebuildable. The model you embedded with sticks for search. Only `myak embed` (never search or hooks) writes or rebuilds it.
+- `models/<model>.ready` is written after the model loads once; hooks and search treat the model as available only if it exists (fastembed's own cache dir names do not match the model id).
+- Hybrid hits farther than cosine distance 0.6 (`VEC_MAX_DISTANCE`) are dropped. Vector-only hits skip the keyword-match guards.
+- `embed.lock` in `myak-state/` serialises embedding; a second run says "another embed is running". `SessionEnd` embeds at most 500 segments per run, niced.
 - The `UserPromptSubmit` hook stays FTS-only. Hybrid applies to `myak query`, MCP and backfill. `SessionEnd` embeds after indexing.
 - Without the extra, or if the model is missing, search falls back to FTS-only.
-- Kill switch: `MYAK_DISABLE_VEC=1`.
+- Kill switch: `MYAK_DISABLE_VEC` is on for `1`, `true`, `yes`, `on` (case-insensitive); anything else leaves vectors enabled.
 
 ## Cross-machine sync
 
@@ -222,7 +225,7 @@ Guidance:
 | `MYAK_STATE_DIR` | `$CLAUDE_DIR/myak-state` | Machine-local state |
 | `MYAK_OBSIDIAN_VAULT` | (none) | Default vault for export; enables the LaunchAgent in `install.sh` |
 | `MYAK_BIN` | (none) | Explicit `myak` binary for the hook launcher |
-| `MYAK_DISABLE_VEC` | (unset) | `1` disables vector search |
+| `MYAK_DISABLE_VEC` | (unset) | `1`/`true`/`yes`/`on` disables vector search |
 | `CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS` | Claude Code default (1500) | Claude Code's SessionEnd budget. Not read by myak. |
 
 The launcher resolves the binary in this order: `$MYAK_BIN`, `~/.local/bin/myak`, the recorded venv python, `myak` on PATH. It never uses `uv tool run`.
