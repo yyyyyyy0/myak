@@ -201,7 +201,9 @@ def handle_request(request):
 
             result = save_memory(content, role=role, session_id=session_id)
 
-            if result["saved"]:
+            if result["saved"] and result.get("duplicate"):
+                text = f"Already saved (duplicate, session: {result['session_id']})"
+            elif result["saved"]:
                 text = f"Saved to memory (session: {result['session_id']})"
             else:
                 text = f"Failed to save: {result['reason']}"
