@@ -343,3 +343,12 @@ def test_session_start_fast_with_300_sessions(env, capsys):
     t0 = time.perf_counter()
     hooks.handle_session_start(json.loads(payload(env, source="startup")))
     assert time.perf_counter() - t0 < 0.3
+
+
+def test_session_start_excludes_current_session(env, capsys):
+    _seed_sessions(env, 2)
+    cur = "seed-/Users/x/proj-1"
+    hooks.dispatch("session-start", payload(env, source="startup", session_id=cur))
+    ctx = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
+    assert ctx.count("\n- [") == 1
+    assert "question number 1" not in ctx

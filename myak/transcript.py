@@ -17,6 +17,7 @@ DROP_TAGS = (
     "command-message",
     "local-command-stdout",
     "local-command-stderr",
+    "local-command-caveat",
 )
 
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")

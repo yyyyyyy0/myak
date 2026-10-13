@@ -225,7 +225,8 @@ def handle_session_start(payload):
         if not require_current(conn):
             _log_schema_once()
             return ""
-        text = recall.format_session_start(recall.recent_sessions(conn, cwd))
+        rows = recall.recent_sessions(conn, cwd, exclude_session=payload.get("session_id"))
+        text = recall.format_session_start(rows)
     finally:
         conn.close()
     if not text:
