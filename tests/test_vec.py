@@ -7,13 +7,13 @@ from datetime import datetime, timezone
 
 import pytest
 
-from myak import config, vec
+from myak import config, db, vec
 from tests.fakes import FakeEmbedder
 
 pytest.importorskip("sqlite_vec")
 
-SCHEMA = """
-PRAGMA user_version=1;
+SCHEMA = f"""
+PRAGMA user_version={db.CURRENT_VERSION};
 CREATE TABLE sessions (
     session_id TEXT PRIMARY KEY, project_path TEXT, started_at TEXT,
     ended_at TEXT, segment_count INTEGER DEFAULT 0, indexed_at TEXT);
