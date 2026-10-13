@@ -205,6 +205,30 @@ def _prune_backups(dest_dir, db_name, keep=KEEP_BACKUPS):
             pass
 
 
+def make_backup(conn, tag, backup_dir=None):
+    """DB のバックアップを取りパスを返す (インメモリ DB なら None)。古いものは刈り込む。"""
+    db_file = _db_file(conn)
+    if db_file is None:
+        return None
+    if backup_dir is not None:
+        dest_dir = Path(backup_dir)
+    else:
+        from myak import config
+
+        dest_dir = config.ensure_state_dir() / "backups"
+    dest_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    backup_path = dest_dir / f"{db_file.name}.bak-{tag}-{stamp}"
+    os.close(os.open(str(backup_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+    dest = sqlite3.connect(str(backup_path))
+    try:
+        conn.backup(dest)
+    finally:
+        dest.close()
+    _prune_backups(dest_dir, db_file.name)
+    return backup_path
+
+
 def migrate(conn, *, backup_dir=None):
     """v0/v1 → 現行版。明示的にのみ呼ぶ。結果 dict を返す。
 
@@ -232,25 +256,7 @@ def migrate(conn, *, backup_dir=None):
     _check_integrity(conn)
     before = _counts(conn)
 
-    backup_path = None
-    db_file = _db_file(conn)
-    if db_file is not None:
-        if backup_dir is not None:
-            dest_dir = Path(backup_dir)
-        else:
-            from myak import config
-
-            dest_dir = config.ensure_state_dir() / "backups"
-        dest_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        backup_path = dest_dir / f"{db_file.name}.bak-v{version}-{stamp}"
-        os.close(os.open(str(backup_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
-        dest = sqlite3.connect(str(backup_path))
-        try:
-            conn.backup(dest)
-        finally:
-            dest.close()
-        _prune_backups(dest_dir, db_file.name)
+    backup_path = make_backup(conn, f"v{version}", backup_dir)
 
     conn.execute("BEGIN IMMEDIATE")
     try:

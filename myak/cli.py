@@ -34,6 +34,11 @@ def build_parser():
     mig = sub.add_parser("migrate", help="Migrate the database schema (explicit only)")
     mig.add_argument("--dry-run", action="store_true", help="Print version and counts only")
 
+    cl = sub.add_parser(
+        "clean-legacy", help="Apply noise filters retroactively to legacy (uuid-less) rows"
+    )
+    cl.add_argument("--dry-run", action="store_true", help="Print counts and examples only")
+
     re = sub.add_parser("reindex", help="Reset cursors and re-run backfill")
     re.add_argument("--full", action="store_true", help="Required: confirm a full reindex")
 
@@ -192,6 +197,10 @@ def main(argv=None):
         return dispatch(args.event, stdin_text)
     if args.command == "migrate":
         return cmd_migrate(args.dry_run)
+    if args.command == "clean-legacy":
+        from myak import cleanup
+
+        return cleanup.run(args.dry_run)
     if args.command == "reindex":
         return cmd_reindex(args.full)
     if args.command == "install-hooks":
