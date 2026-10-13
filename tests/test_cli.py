@@ -334,7 +334,16 @@ def test_launcher_recorded_venv_python(tmp_path, isolated_launcher):
     (state / "venv-python").write_text(f"{fake_py}\n")
     r = _run_launcher(isolated_launcher, home, "session-end", "{}")
     assert r.returncode == 0
-    assert (tmp_path / "pycalled").read_text().strip() == "-m myak.cli hook session-end"
+    assert (tmp_path / "pycalled").read_text().strip() == "-I -m myak.cli hook session-end"
+
+
+def test_launcher_without_home_exits_zero_silently(isolated_launcher):
+    r = subprocess.run(
+        ["env", "-i", "sh", str(isolated_launcher), "prompt"],
+        input="{}", capture_output=True, text=True, timeout=10,
+    )
+    assert r.returncode == 0
+    assert r.stdout == "" and r.stderr == ""
 
 
 def test_launcher_path_fallback(tmp_path, isolated_launcher):

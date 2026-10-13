@@ -84,6 +84,18 @@ def test_session_end_detaches_and_child_indexes(env):
     assert seg_count(env) == 2
 
 
+def test_session_end_popen_hardened(env, monkeypatch):
+    calls = []
+    monkeypatch.setattr(hooks.subprocess, "Popen", lambda cmd, **kw: calls.append((cmd, kw)))
+    assert hooks.dispatch("session-end", payload(env)) == 0
+    (cmd, kw), = calls
+    assert cmd[:3] == [hooks.sys.executable, "-I", "-m"]
+    assert f"--file={env.transcript.resolve()}" in cmd or f"--file={env.transcript}" in cmd
+    assert "--file" not in cmd
+    assert kw["cwd"] == str(config.STATE_DIR)
+    assert kw["start_new_session"] is True
+
+
 @pytest.mark.parametrize("event", ["stop", "session-end", "prompt", "session-start"])
 @pytest.mark.parametrize("stdin", ["", "   ", "{not json", "[1,2]", "null"])
 def test_bad_stdin_exits_zero_silently_and_logs(env, capsys, event, stdin):

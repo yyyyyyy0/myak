@@ -48,6 +48,43 @@ def ensure_memory_dir():
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def ensure_state_dir():
+    """機械ローカルの STATE_DIR を 0700 で作成する (同期対象外・実行物/ログ/派生物用)。"""
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(STATE_DIR, 0o700)
+    except OSError:
+        pass
+    return STATE_DIR
+
+
+def secure_file(path, mode=0o600):
+    """作成直後のファイルのモードを絞る (失敗は無視)。"""
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
+def atomic_write(dest, data, mode):
+    """tmp + chmod + os.replace で原子的に書く。dest がシンボリックリンクなら先に外す。"""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.is_symlink():
+        dest.unlink()
+    tmp = dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.chmod(tmp, mode)
+        os.replace(tmp, dest)
+    except BaseException:
+        if tmp.exists():
+            tmp.unlink()
+        raise
+
+
 def get_connection():
     """同期セーフな SQLite 接続を返す。
 

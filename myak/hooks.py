@@ -155,12 +155,15 @@ def handle_session_end(payload):
     if conn is None:
         return
     conn.close()
-    cmd = [sys.executable, "-m", "myak.cli", "index", "--file", str(path), "--final"]
+    # -I: PYTHON* 環境変数/ユーザー site/cwd を無視。--file=: '-' 始まりのパスをオプション扱いさせない
+    cmd = [sys.executable, "-I", "-m", "myak.cli", "index", f"--file={path}", "--final"]
     slug = _project_slug(payload)
     if slug:
         cmd += ["--project", slug]
+    config.ensure_state_dir()
     subprocess.Popen(  # noqa: S603 - fixed argv, detached on purpose
         cmd,
+        cwd=str(config.STATE_DIR),
         start_new_session=True,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
