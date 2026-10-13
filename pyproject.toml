@@ -34,7 +34,7 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--cov=myak --cov-report=term-missing --cov-fail-under=42"
+addopts = "--cov=myak --cov-report=term-missing --cov-fail-under=80"
 
 [tool.coverage.run]
 source = ["myak"]
