@@ -54,6 +54,7 @@ def test_pyproject_registers_scripts():
 
 
 def test_hook_subcommand_reads_stdin(env, monkeypatch, capsys):
+    monkeypatch.setattr(config, "PROJECTS_DIR", env.tmp / "projects")
     t = env.tmp / "projects" / "-Users-x-p" / "s.jsonl"
     write(t, [rec("u1", "user", text(1)), rec("a1", "assistant", text(2))])
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"transcript_path": str(t)})))

@@ -5,6 +5,7 @@
 
 import json
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -106,9 +107,19 @@ def _transcript(payload, event):
     if not isinstance(tp, str) or not tp:
         log(f"{event}: no transcript_path in payload")
         return None
-    path = Path(tp).expanduser()
-    if not path.is_file():
-        log(f"{event}: transcript not found: {path}")
+    raw = Path(tp).expanduser()
+    try:
+        is_link = raw.is_symlink()
+        path = raw.resolve(strict=True)
+    except (OSError, RuntimeError):
+        log(f"{event}: transcript not found: {raw}")
+        return None
+    if is_link or not path.is_file():
+        log(f"{event}: transcript rejected (symlink or not a file): {raw}")
+        return None
+    root = config.PROJECTS_DIR.resolve()
+    if path.suffix != ".jsonl" or os.path.commonpath([str(path), str(root)]) != str(root):
+        log(f"{event}: transcript rejected (must be .jsonl under {root}): {raw}")
         return None
     return path
 

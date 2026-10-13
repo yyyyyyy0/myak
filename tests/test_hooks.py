@@ -15,6 +15,7 @@ from tests.test_db_migration import make_v0
 def env(db_env, tmp_path, monkeypatch):
     e = setup_env(db_env, tmp_path, monkeypatch)
     monkeypatch.setattr(config, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(config, "PROJECTS_DIR", tmp_path / "projects")
     monkeypatch.setenv("MYAK_DIR", str(db_env.memory_dir))
     monkeypatch.setenv("MYAK_STATE_DIR", str(tmp_path / "state"))
     e.conn.close()
@@ -218,3 +219,59 @@ def test_schema_marker_in_state_dir_0600(env):
     marker = env.log.parent / "schema-warned"
     assert marker.exists() and oct(marker.stat().st_mode & 0o777) == "0o600"
     assert not (env.memory_dir / "schema-warned").exists()
+
+
+@pytest.mark.parametrize("event", ["stop", "session-end"])
+def test_transcript_outside_projects_dir_rejected(env, tmp_path, monkeypatch, event):
+    outside = tmp_path / "elsewhere" / "sess.jsonl"
+    write(outside, [rec("u1", "user", text(1))])
+    popen = []
+    monkeypatch.setattr(hooks.subprocess, "Popen", lambda *a, **k: popen.append(a))
+    p = json.dumps({"transcript_path": str(outside), "cwd": "/Users/x/proj"})
+    assert hooks.dispatch(event, p) == 0
+    assert "rejected" in env.log.read_text()
+    assert seg_count(env) == 0 and not popen
+
+
+def test_transcript_sibling_prefix_dir_rejected(env, tmp_path):
+    evil = tmp_path / "projects-evil" / "s.jsonl"  # 文字列プレフィクスは一致するが配下ではない
+    write(evil, [rec("u1", "user", text(1))])
+    hooks.dispatch("stop", json.dumps({"transcript_path": str(evil)}))
+    assert "rejected" in env.log.read_text() and seg_count(env) == 0
+
+
+def test_transcript_wrong_suffix_rejected(env):
+    bad = env.transcript.with_suffix(".txt")
+    bad.write_text("x")
+    hooks.dispatch("stop", json.dumps({"transcript_path": str(bad)}))
+    assert "rejected" in env.log.read_text() and seg_count(env) == 0
+
+
+def test_transcript_symlink_rejected_even_inside_projects(env, tmp_path):
+    target = tmp_path / "secret.jsonl"
+    write(target, [rec("u1", "user", text(1))])
+    link = env.transcript.with_name("link.jsonl")
+    link.symlink_to(target)
+    hooks.dispatch("stop", json.dumps({"transcript_path": str(link)}))
+    assert "rejected" in env.log.read_text() and seg_count(env) == 0
+
+
+def test_transcript_dotdot_escape_rejected(env, tmp_path):
+    outside = tmp_path / "out.jsonl"
+    write(outside, [rec("u1", "user", text(1))])
+    sneaky = tmp_path / "projects" / ".." / "out.jsonl"
+    hooks.dispatch("stop", json.dumps({"transcript_path": str(sneaky)}))
+    assert "rejected" in env.log.read_text() and seg_count(env) == 0
+
+
+def test_transcript_dash_leading_relative_path_safe(env, tmp_path, monkeypatch):
+    # '-' 始まりの相対パスは --file= 形式で option として解釈されない
+    monkeypatch.setattr(config, "PROJECTS_DIR", tmp_path)
+    monkeypatch.chdir(tmp_path)
+    calls = []
+    monkeypatch.setattr(hooks.subprocess, "Popen", lambda cmd, **kw: calls.append(cmd))
+    write(tmp_path / "-evil.jsonl", [rec("u1", "user", text(1))])
+    hooks.dispatch("session-end", json.dumps({"transcript_path": "-evil.jsonl"}))
+    # 相対パスは resolve 済みの絶対パスで渡る
+    assert calls and calls[0][calls[0].index("-m") + 2] == "index"
+    assert any(a.startswith("--file=/") for a in calls[0])
