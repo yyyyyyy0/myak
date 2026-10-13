@@ -48,6 +48,22 @@ class TestCleanText:
         assert clean_text("  \n hi \n ") == "hi"
 
 
+class TestCleanTextPerformance:
+    @pytest.mark.parametrize("role", [None, "user", "assistant"])
+    def test_many_unclosed_openers_is_linear(self, role):
+        import time
+
+        text = ("<system-reminder>" + "y" * 133) * 2000
+        assert len(text) >= 300_000
+        t0 = time.perf_counter()
+        clean_text(text, role)
+        assert time.perf_counter() - t0 < 0.2
+
+    def test_many_closed_blocks(self):
+        text = "k<system-reminder>z</system-reminder>" * 5000
+        assert clean_text(text) == "k" * 5000
+
+
 class TestExtractTextContent:
     def test_str(self):
         assert extract_text_content("  hi ") == "hi"
@@ -99,8 +115,26 @@ class TestRecordToSegment:
     def test_drop_tags(self, tag):
         assert record_to_segment(_rec(f"<{tag}>{LONG}</{tag}>")) is None
 
-    def test_drop_tag_among_real_text(self):
-        assert record_to_segment(_rec(f"{LONG} <command-name>/x</command-name>")) is None
+    def test_drop_tag_only_when_leading(self):
+        assert record_to_segment(_rec(f"  \n<command-name>/x</command-name>{LONG}")) is None
+        seg = record_to_segment(_rec(f"{LONG} <command-name>/x</command-name>"))
+        assert seg is not None
+
+    def test_assistant_mentioning_drop_tag_is_kept(self):
+        rec = {"type": "assistant", "uuid": "a", "timestamp": "t",
+               "message": {"role": "assistant", "content": [
+                   {"type": "text", "text": f"{LONG} the <command-name> tag is used"}]}}
+        assert record_to_segment(rec) is not None
+        rec["message"]["content"][0]["text"] = f"<command-name>{LONG}</command-name>"
+        assert record_to_segment(rec) is not None
+
+    def test_unclosed_noise_tag_user_drops_to_end(self):
+        seg = record_to_segment(_rec(f"{LONG} <system-reminder>never closed {LONG}"))
+        assert seg["content"] == LONG
+
+    def test_unclosed_noise_tag_assistant_kept(self):
+        assert clean_text("a <system-reminder>never closed", "assistant") == (
+            "a <system-reminder>never closed")
 
     def test_cleaned_too_short(self):
         assert record_to_segment(_rec(f"<system-reminder>{LONG}</system-reminder>ok")) is None
@@ -203,6 +237,21 @@ class TestExtractSegmentsFixture:
     def test_subagent_file(self, fixtures_dir):
         segs, _ = extract_segments(fixtures_dir / "subagents" / "agent-a1.jsonl")
         assert [s["uuid"] for s in segs] == ["g1", "g2", "g3"]
+
+
+class TestRobustness:
+    def test_non_str_text_block_ignored(self):
+        assert extract_text_content([{"type": "text", "text": 5},
+                                     {"type": "text", "text": ["a"]},
+                                     {"type": "text", "text": " ok "}]) == "ok"
+
+    def test_deeply_nested_json_does_not_crash(self, tmp_path):
+        p = tmp_path / "s.jsonl"
+        deep = "[" * 100000 + "]" * 100000
+        good = json.dumps({"type": "user"})
+        p.write_bytes((deep + "\n" + good + "\n").encode())
+        recs = list(iter_records(p))
+        assert len(recs) == 1 and recs[0][0]["type"] == "user"
 
 
 class TestReadAgentMeta:

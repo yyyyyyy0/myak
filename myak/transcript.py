@@ -11,26 +11,47 @@ from myak.config import MAX_CONTENT_LENGTH, MIN_CONTENT_LENGTH
 
 # <tag>...</tag> ブロックを除去し、周囲のテキストは残す
 NOISE_TAGS = ("system-reminder", "task-notification", "side-sessions-event")
-# これらを含むレコードは丸ごと捨てる
+# user ロールで、本文が先頭からこれらで始まるレコードは丸ごと捨てる (slash command の残骸)
 DROP_TAGS = (
     "command-name",
     "command-message",
-    "command-args",
     "local-command-stdout",
     "local-command-stderr",
 )
 
-_NOISE_RE = re.compile(
-    "|".join(f"<{t}>.*?</{t}>" for t in NOISE_TAGS),
-    re.DOTALL,
-)
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 _BLANKS_RE = re.compile(r"\n{3,}")
 
 
-def clean_text(text):
+def _strip_tag(text, tag, role):
+    """<tag>...</tag> を線形時間で除去する (正規表現のバックトラックを避ける)。
+
+    閉じタグが無い場合: user は開きタグから末尾までを捨て、それ以外はそのまま残す。
+    """
+    open_tag = f"<{tag}>"
+    close_tag = f"</{tag}>"
+    parts = []
+    pos = 0
+    while True:
+        start = text.find(open_tag, pos)
+        if start < 0:
+            break
+        end = text.find(close_tag, start + len(open_tag))
+        if end < 0:
+            if role == "user":
+                parts.append(text[pos:start])
+                return "".join(parts)
+            break
+        parts.append(text[pos:start])
+        pos = end + len(close_tag)
+    parts.append(text[pos:])
+    return "".join(parts)
+
+
+def clean_text(text, role=None):
     """ノイズタグ除去・制御文字除去・空行圧縮を行う。"""
-    text = _NOISE_RE.sub("", text)
+    for tag in NOISE_TAGS:
+        text = _strip_tag(text, tag, role)
     text = _CONTROL_RE.sub("", text)
     text = _BLANKS_RE.sub("\n\n", text)
     return text.strip()
@@ -44,7 +65,8 @@ def extract_text_content(content):
         texts = []
         for block in content:
             if isinstance(block, dict) and block.get("type") == "text":
-                text = (block.get("text") or "").strip()
+                raw = block.get("text")
+                text = raw.strip() if isinstance(raw, str) else ""
                 if text:
                     texts.append(text)
         return "\n".join(texts)
@@ -71,7 +93,7 @@ def iter_records_with_start(path, start_offset=0, final=False):
             if line:
                 try:
                     rec = json.loads(line.decode("utf-8"))
-                except (UnicodeDecodeError, ValueError):
+                except (UnicodeDecodeError, ValueError, RecursionError):
                     rec = None
             if not terminated and not isinstance(rec, dict):
                 # 未完結かつ解釈不能な末尾は消費しない (後続の追記で完結しうる)
@@ -110,16 +132,17 @@ def record_to_segment(rec):
         return None
 
     text = extract_text_content(raw_content)
-    if any(f"<{tag}>" in text for tag in DROP_TAGS):
+    role = msg.get("role", rec_type)
+    if role == "user" and text.lstrip().startswith(tuple(f"<{t}>" for t in DROP_TAGS)):
         return None
 
-    text = clean_text(text)
+    text = clean_text(text, role)
     if len(text) < MIN_CONTENT_LENGTH:
         return None
 
     return {
         "uuid": rec.get("uuid"),
-        "role": msg.get("role", rec_type),
+        "role": role,
         "content": text[:MAX_CONTENT_LENGTH],
         "timestamp": rec.get("timestamp", ""),
         "is_sidechain": bool(rec.get("isSidechain", False)),
