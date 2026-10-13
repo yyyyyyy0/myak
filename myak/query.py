@@ -78,7 +78,12 @@ def matching_token_count(content, tokens):
 
 
 def filter_results(results, tokens, *, hook_mode=False):
-    """閾値フィルタ + session dedupe。結果はスコア降順にソートされる。"""
+    """閾値フィルタ + session dedupe。結果はスコア降順にソートされる。
+
+    source=="vec" (ベクトルのみ・語彙が一致しない意味的近傍) は、語彙前提の
+    トークン一致ガードと絶対スコア下限を免除する (相対スコア下限は適用)。
+    距離の足切りは検索側 (config.VEC_MAX_DISTANCE) で済んでいる。
+    """
     if not results:
         return []
 
@@ -88,13 +93,14 @@ def filter_results(results, tokens, *, hook_mode=False):
     seen_sessions = set()
 
     for r in results:
-        if r["score"] < MIN_ABSOLUTE_SCORE:
+        vec_only = r.get("source") == "vec"
+        if not vec_only and r["score"] < MIN_ABSOLUTE_SCORE:
             continue
         if best > 0 and r["score"] < best * MIN_RELATIVE_SCORE:
             continue
-        token_count = matching_token_count(r["content"], tokens)
-        if len(tokens) >= TOKEN_MATCH_GUARD and token_count < MIN_MATCHING_TOKENS:
-            continue
+        if not vec_only and len(tokens) >= TOKEN_MATCH_GUARD:
+            if matching_token_count(r["content"], tokens) < MIN_MATCHING_TOKENS:
+                continue
         if hook_mode:
             sid = r["session_id"]
             if sid in seen_sessions:
@@ -111,6 +117,13 @@ def search(query, max_results=MAX_RESULTS, use_vec=False):
     from myak.search import hybrid_search
 
     return hybrid_search(query, max_results, use_vec=use_vec)
+
+
+def filter_hybrid(results, query):
+    """ハイブリッド (ベクトル由来を含む) 結果だけに閾値フィルタを掛ける。FTS のみはそのまま。"""
+    if not any(r.get("source") in ("vec", "both") for r in results):
+        return results
+    return filter_results(results, tokenize_query_terms(query))
 
 
 def format_plain(results, query):
@@ -249,6 +262,7 @@ def main(argv=None):
     if args.hybrid is None:
         args.hybrid = not config.vec_disabled()
     results = search(query, args.limit, use_vec=args.hybrid)
+    results = filter_hybrid(results, query)
 
     if args.codex:
         output = format_codex(results, query)

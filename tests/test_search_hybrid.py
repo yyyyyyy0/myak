@@ -128,3 +128,63 @@ def test_mcp_search_falls_back(corpus, monkeypatch):
     monkeypatch.setattr(mcp_server, "search", fake_search)
     assert "No memories" in mcp_server.myak_search("garage")
     assert calls == [True, False]
+
+
+def _use_fake_embedder(monkeypatch, model="fake-model"):
+    monkeypatch.setattr(vec, "default_embedder", lambda **kw: FakeEmbedder(model))
+
+
+def test_results_carry_source(corpus):
+    hits = search.hybrid_search("garage automobile", 5, embedder=FakeEmbedder())
+    assert hits[0]["source"] == "both"
+    assert {h["source"] for h in hits} <= {"fts", "vec", "both"}
+    syn = search.hybrid_search("vehicle", 5, embedder=FakeEmbedder())
+    assert syn[0]["source"] == "vec"
+    assert query.search("garage", 5)[0]["source"] == "fts"
+
+
+def test_far_neighbours_are_cut_by_distance(corpus):
+    hits = search.hybrid_search("vehicle", 5, embedder=FakeEmbedder())
+    contents = " ".join(h["content"] for h in hits)
+    assert "automobile" in contents
+    assert "gardening" not in contents and "login" not in contents
+
+
+def test_cli_hybrid_keeps_synonym_only_hit(corpus, monkeypatch, capsys):
+    _use_fake_embedder(monkeypatch)
+    # 3 トークン以上 + 語彙一致ゼロ: 旧実装ではトークンガードで落ちていた
+    query.main(["vehicle problem today", "--hybrid"])
+    out = capsys.readouterr().out
+    assert "automobile repair notes" in out
+    assert "gardening" not in out and "login flow" not in out
+
+
+def test_cli_hybrid_drops_unrelated_query(corpus, monkeypatch, capsys):
+    _use_fake_embedder(monkeypatch)
+    query.main(["bug glitch defect", "--hybrid"])
+    assert "No memories found" in capsys.readouterr().out
+
+
+def test_filter_results_exempts_vec_only_from_guards():
+    base = {"role": "user", "timestamp": "", "session_id": "s", "project": ""}
+    both = {**base, "content": "alpha beta gamma", "score": 1.0, "source": "both"}
+    vec_only = {**base, "content": "nothing shared", "score": 0.4, "source": "vec"}
+    weak_vec = {**base, "content": "nothing shared", "score": 0.1, "source": "vec"}
+    weak_fts = {**base, "content": "alpha beta gamma", "score": 0.01, "source": "fts"}
+    tokens = ["alpha", "beta", "gamma"]
+    kept = query.filter_results([both, vec_only, weak_vec, weak_fts], tokens)
+    assert kept == [both, vec_only]  # 相対下限は vec にも効く / 絶対下限は FTS にだけ効く
+
+
+def test_filter_hybrid_leaves_fts_only_untouched():
+    rows = [{"content": "x", "score": 0.0001, "source": "fts", "session_id": "s"}]
+    assert query.filter_hybrid(rows, "alpha beta gamma") is rows
+
+
+def test_default_embedder_is_cached_per_model(monkeypatch):
+    search._cached_fastembed.cache_clear()
+    vec.write_ready_marker(vec.config.VEC_MODEL, 384)
+    first = search._default_embedder()
+    assert search._default_embedder() is first
+    assert isinstance(first, vec.FastEmbedEmbedder) and first.local_files_only
+    search._cached_fastembed.cache_clear()
