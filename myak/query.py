@@ -186,6 +186,18 @@ def _sanitize(text):
     return _CONTROL_CHARS.sub("", str(text))
 
 
+HOOK_FOOTER = "（参考データここまで）"
+
+
+def _escape(text):
+    """タグ/属性を閉じられないよう < > " を実体参照にする。"""
+    return text.replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _flat(text):
+    return _escape(_NEWLINES.sub(" ", _sanitize(text)))
+
+
 def format_hook(results, query):
     if not results:
         return ""
@@ -193,10 +205,14 @@ def format_hook(results, query):
     for r in results[:HOOK_MAX_RESULTS]:
         project = r["project"].split("-")[-1] if r["project"] else "?"
         # 改行を畳み、過去メッセージが見出し行などを偽造できないようにする
-        snippet = _NEWLINES.sub(" ", _sanitize(r["content"][:HOOK_SNIPPET_CHARS]))
-        stamp = _NEWLINES.sub(" ", _sanitize(r["timestamp"]))
-        lines.append(f"[{stamp} | {_NEWLINES.sub(' ', _sanitize(project))}] {snippet}")
+        snippet = _flat(r["content"][:HOOK_SNIPPET_CHARS])
+        stamp = _flat(r["timestamp"])
+        lines.append(
+            f'<past-memory untrusted="true" date="{stamp}" project="{_flat(project)}">'
+            f"{snippet}</past-memory>"
+        )
         lines.append("")
+    lines.append(HOOK_FOOTER)
     return json.dumps(
         {
             "hookSpecificOutput": {
