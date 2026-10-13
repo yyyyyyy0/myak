@@ -51,28 +51,40 @@ def extract_text_content(content):
     return ""
 
 
-def iter_records(path, start_offset=0):
-    """完結した行 (末尾 \\n あり) のみ (record, end_offset) として yield する。
+def iter_records_with_start(path, start_offset=0, final=False):
+    """(record, start_offset, end_offset) を yield する。
 
-    壊れた JSON 行はスキップするがオフセットは進める。
-    末尾の改行なしの行は yield せず、オフセットも進めない。
+    完結行 (末尾 \\n あり) のみ対象。壊れた JSON 行はスキップするがオフセットは進める。
+    末尾の改行なしの行は通常 yield せずオフセットも進めない。
+    final=True の場合のみ、JSON として解釈できれば受理してオフセットを EOF まで進める。
     """
     with open(path, "rb") as f:
         f.seek(start_offset)
         offset = start_offset
         for raw in f:
-            if not raw.endswith(b"\n"):
+            terminated = raw.endswith(b"\n")
+            if not terminated and not final:
+                return
+            start = offset
+            line = raw.strip()
+            rec = None
+            if line:
+                try:
+                    rec = json.loads(line.decode("utf-8"))
+                except (UnicodeDecodeError, ValueError):
+                    rec = None
+            if not terminated and not isinstance(rec, dict):
+                # 未完結かつ解釈不能な末尾は消費しない (後続の追記で完結しうる)
                 return
             offset += len(raw)
-            line = raw.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line.decode("utf-8"))
-            except (UnicodeDecodeError, ValueError):
-                continue
             if isinstance(rec, dict):
-                yield rec, offset
+                yield rec, start, offset
+
+
+def iter_records(path, start_offset=0, final=False):
+    """完結した行のみ (record, end_offset) として yield する。"""
+    for rec, _start, end in iter_records_with_start(path, start_offset, final):
+        yield rec, end
 
 
 def _has_tool_result_only(content):
@@ -116,14 +128,18 @@ def record_to_segment(rec):
     }
 
 
-def extract_segments(path, start_offset=0):
-    """(segments, new_offset) を返す。new_offset は最後に消費した完結行の終端。"""
+def extract_segments(path, start_offset=0, final=False):
+    """(segments, new_offset) を返す。new_offset は最後に消費した行の終端。
+
+    各 segment には、そのレコードの開始バイトオフセット `start_offset` が付く。
+    """
     segments = []
     offset = start_offset
-    for rec, end_offset in iter_records(path, start_offset):
-        offset = end_offset
+    for rec, start, end in iter_records_with_start(path, start_offset, final):
+        offset = end
         seg = record_to_segment(rec)
         if seg is not None:
+            seg["start_offset"] = start
             segments.append(seg)
     return segments, offset
 

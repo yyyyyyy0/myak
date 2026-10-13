@@ -219,3 +219,26 @@ class TestReadAgentMeta:
     def test_invalid_or_untyped(self, tmp_path, body):
         (tmp_path / "agent-z.meta.json").write_text(body)
         assert read_agent_meta(tmp_path / "agent-z.jsonl")["agent_type"] == "unknown"
+
+
+class TestFinalAndStartOffsets:
+    def test_final_accepts_valid_unterminated_tail(self, tmp_path):
+        p = tmp_path / "t.jsonl"
+        p.write_bytes(b'{"a":1}\n{"b":2}')
+        assert list(iter_records(p, 0, final=True)) == [({"a": 1}, 8), ({"b": 2}, 15)]
+        assert list(iter_records(p, 0)) == [({"a": 1}, 8)]
+
+    def test_final_rejects_invalid_unterminated_tail(self, tmp_path):
+        p = tmp_path / "t.jsonl"
+        p.write_bytes(b'{"a":1}\n{"b":')
+        assert list(iter_records(p, 0, final=True)) == [({"a": 1}, 8)]
+
+    def test_segments_carry_start_offset(self, tmp_path):
+        import json
+
+        a = json.dumps(_rec(LONG)).encode() + b"\n"
+        p = tmp_path / "t.jsonl"
+        p.write_bytes(a + a)
+        segs, off = extract_segments(p)
+        assert [s["start_offset"] for s in segs] == [0, len(a)]
+        assert off == 2 * len(a)

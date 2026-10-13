@@ -5,6 +5,7 @@ Stop hook から stdin 経由、または CLI 引数で呼ばれる。
 
 import argparse
 import json
+import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,9 +15,12 @@ from myak.config import (
     ensure_memory_dir,
     get_connection,
 )
-from myak.db import create_schema
+from myak.db import create_schema, require_current
+from myak.state import clear_cursor, fingerprint, get_cursor, set_cursor
 from myak.transcript import extract_segments as _extract_segments
-from myak.transcript import extract_text_content  # noqa: F401  (backward compat)
+from myak.transcript import (
+    extract_text_content,  # noqa: F401  (backward compat)
+)
 
 
 def init_db(conn):
@@ -61,45 +65,151 @@ def find_latest_jsonl(project_slug):
     return jsonl_files[0] if jsonl_files else None
 
 
-def index_session(conn, jsonl_path, project_slug=None):
-    """1セッション分の JSONL をインデックスする。冪等。"""
-    session_id = jsonl_path.stem
+def _needs_full_rescan(path, cursor, size):
+    """D2: カーソルが信頼できなければ True。"""
+    if cursor is None:
+        return True
+    if cursor["offset"] > size or size < cursor["size"]:
+        return True
+    _, sha = fingerprint(path, limit=cursor["size"])
+    if sha != cursor["sha1"]:
+        return True
+    if cursor["offset"] > 0:
+        with open(path, "rb") as f:
+            f.seek(cursor["offset"] - 1)
+            if f.read(1) != b"\n":
+                return True
+    return False
+
+
+def _is_legacy_session(conn, session_id):
+    """desktop- 以外で、行が存在しすべて uuid が NULL のセッションか。"""
+    if session_id.startswith("desktop-"):
+        return False
+    row = conn.execute(
+        "SELECT COUNT(*), COUNT(uuid) FROM segments WHERE session_id = ?", (session_id,)
+    ).fetchone()
+    return row[0] > 0 and row[1] == 0
+
+
+_INSERT_SEGMENT = (
+    "INSERT INTO segments(session_id, role, content, timestamp, uuid, agent_id, agent_type) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+    "ON CONFLICT(session_id, agent_id, uuid) WHERE uuid IS NOT NULL DO NOTHING"
+)
+
+_UPSERT_SESSION = (
+    "INSERT INTO sessions "
+    "(session_id, project_path, started_at, ended_at, segment_count, indexed_at, cwd) "
+    "VALUES (?, ?, ?, ?, 0, ?, ?) "
+    "ON CONFLICT(session_id) DO UPDATE SET "
+    "ended_at = MAX(COALESCE(sessions.ended_at, ''), COALESCE(excluded.ended_at, '')), "
+    "segment_count = (SELECT COUNT(*) FROM segments WHERE session_id = excluded.session_id), "
+    "indexed_at = excluded.indexed_at, "
+    "cwd = COALESCE(sessions.cwd, excluded.cwd)"
+)
+
+
+def index_session(
+    conn, jsonl_path, project_slug=None, *, final=False, agent_id="", agent_type=None,
+    session_id=None,
+):
+    """1 transcript ファイルをインクリメンタルにインデックスする。挿入行数を返す。
+
+    session_id 省略時はファイル名 stem。サブエージェントでは親セッション ID を渡す。
+    """
+    jsonl_path = Path(jsonl_path)
+    if session_id is None:
+        session_id = jsonl_path.stem
     if project_slug is None:
         project_slug = jsonl_path.parent.name
 
-    existing = conn.execute(
-        "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
-    ).fetchone()
-    if existing:
+    try:
+        size = jsonl_path.stat().st_size
+    except OSError:
         return 0
 
-    segments = extract_segments(jsonl_path)
-    if not segments:
+    cursor = get_cursor(jsonl_path)
+    try:
+        full = _needs_full_rescan(jsonl_path, cursor, size)
+    except OSError:
         return 0
+    start_offset = 0 if full else cursor["offset"]
+
+    # ロック取得前にパースする
+    try:
+        segments, new_offset = _extract_segments(jsonl_path, start_offset, final)
+        new_size, new_sha = fingerprint(jsonl_path)
+    except OSError:
+        return 0
+
+    if full and cursor is not None:
+        clear_cursor(jsonl_path)
+
+    if not segments:
+        set_cursor(jsonl_path, new_offset, new_size, new_sha)
+        return 0
+
+    if conn.isolation_level is not None:
+        conn.commit()
+        conn.isolation_level = None
 
     now = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        "INSERT INTO sessions "
-        "(session_id, project_path, started_at, ended_at, segment_count, indexed_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (
-            session_id,
-            project_slug,
-            segments[0]["timestamp"],
-            segments[-1]["timestamp"],
-            len(segments),
-            now,
-        ),
-    )
+    basename = jsonl_path.name
+    cwd = next((s["cwd"] for s in segments if s.get("cwd")), None)
 
-    for seg in segments:
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as e:
+        if "locked" in str(e) or "busy" in str(e):
+            print(f"myak: database is locked, skipping {basename}: {e}", file=sys.stderr)
+            return 0
+        raise
+
+    inserted = 0
+    try:
+        if start_offset == 0 and agent_id == "" and _is_legacy_session(conn, session_id):
+            conn.execute("DELETE FROM segments WHERE session_id = ?", (session_id,))
         conn.execute(
-            "INSERT INTO segments (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
-            (session_id, seg["role"], seg["content"], seg["timestamp"]),
+            _UPSERT_SESSION,
+            (
+                session_id, project_slug, segments[0]["timestamp"],
+                segments[-1]["timestamp"], now, cwd,
+            ),
         )
+        for seg in segments:
+            uuid = seg["uuid"] or f"f:{basename}:{seg['start_offset']}"
+            cur = conn.execute(
+                _INSERT_SEGMENT,
+                (
+                    session_id, seg["role"], seg["content"], seg["timestamp"],
+                    uuid, agent_id, agent_type,
+                ),
+            )
+            inserted += max(cur.rowcount, 0)
+        conn.execute(
+            "UPDATE sessions SET segment_count = "
+            "(SELECT COUNT(*) FROM segments WHERE session_id = ?) WHERE session_id = ?",
+            (session_id, session_id),
+        )
+        conn.execute("COMMIT")
+    except sqlite3.OperationalError as e:
+        _rollback(conn)
+        if "locked" in str(e) or "busy" in str(e):
+            print(f"myak: database is locked, skipping {basename}: {e}", file=sys.stderr)
+            return 0
+        raise
+    except BaseException:
+        _rollback(conn)
+        raise
 
-    conn.commit()
-    return len(segments)
+    set_cursor(jsonl_path, new_offset, new_size, new_sha)
+    return inserted
+
+
+def _rollback(conn):
+    if conn.in_transaction:
+        conn.execute("ROLLBACK")
 
 
 def cwd_to_project_slug(cwd):
@@ -129,6 +239,12 @@ def run_from_hook():
     conn = get_connection()
     try:
         init_db(conn)
+        if not require_current(conn):
+            print(
+                "myak: database schema is not current; run `myak migrate` "
+                "(skipping index)", file=sys.stderr,
+            )
+            return
         count = index_session(conn, jsonl_path, project_slug)
         if count > 0:
             print(f"Indexed {count} segments from {jsonl_path.name}", file=sys.stderr)
@@ -160,7 +276,10 @@ def run_from_cli():
     conn = get_connection()
     try:
         init_db(conn)
-        count = index_session(conn, jsonl_path, args.project)
+        if not require_current(conn):
+            print("Database schema is not current; run `myak migrate` first.", file=sys.stderr)
+            sys.exit(1)
+        count = index_session(conn, jsonl_path, args.project, final=True)
         print(f"Indexed {count} segments from {jsonl_path.name}")
     finally:
         conn.close()
