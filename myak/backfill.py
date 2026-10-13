@@ -6,7 +6,7 @@ import time
 
 from myak import config
 from myak.config import ensure_memory_dir, get_connection
-from myak.db import require_current
+from myak.db import DatabaseLocked, require_current
 from myak.indexer import index_transcript_tree, init_db
 
 
@@ -26,6 +26,7 @@ def backfill(project_filter=None, rebuild_fts=False):
         total_sessions = 0
         total_segments = 0
         skipped = 0
+        locked = []
         start = time.time()
 
         projects_dir = config.PROJECTS_DIR
@@ -45,7 +46,12 @@ def backfill(project_filter=None, rebuild_fts=False):
             print(f"\n[{project_slug}] {len(jsonl_files)} files")
 
             for jsonl_path in jsonl_files:
-                count = index_transcript_tree(conn, jsonl_path, project_slug, final=True)
+                try:
+                    count = index_transcript_tree(conn, jsonl_path, project_slug, final=True)
+                except DatabaseLocked:
+                    locked.append(str(jsonl_path))
+                    print(f"  ! {jsonl_path.name}: database locked", file=sys.stderr)
+                    continue
                 if count > 0:
                     total_sessions += 1
                     total_segments += count
@@ -63,6 +69,11 @@ def backfill(project_filter=None, rebuild_fts=False):
         print(f"Segments created: {total_segments}")
         print(f"Skipped (already indexed or empty): {skipped}")
         print(f"Time: {elapsed:.1f}s")
+        if locked:
+            print(f"Locked (not indexed, re-run later): {len(locked)}", file=sys.stderr)
+            for path in locked:
+                print(f"  {path}", file=sys.stderr)
+            return 3
         return 0
     finally:
         conn.close()

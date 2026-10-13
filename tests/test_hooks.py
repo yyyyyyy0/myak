@@ -159,6 +159,19 @@ def test_exception_is_swallowed_and_logged(env, monkeypatch, capsys):
     assert capsys.readouterr().out == ""
 
 
+def test_stop_database_locked_logged_exit_zero(env, monkeypatch, capsys):
+    from myak.db import DatabaseLocked
+
+    def locked(*a, **k):
+        raise DatabaseLocked("database is locked, skipping sess-1.jsonl")
+
+    monkeypatch.setattr(hooks, "index_transcript_tree", locked)
+    assert hooks.dispatch("stop", payload(env)) == 0
+    assert "database is locked" in env.log.read_text()
+    assert "Traceback" not in env.log.read_text()
+    assert capsys.readouterr().out == ""
+
+
 def test_log_rotates(env, monkeypatch):
     monkeypatch.setattr(hooks, "LOG_MAX_BYTES", 300)
     for i in range(30):

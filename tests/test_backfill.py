@@ -111,3 +111,22 @@ def test_missing_projects_dir(db_env, tmp_path, monkeypatch):
     monkeypatch.setattr(config, "STATE_DB_PATH", tmp_path / "st" / "s.db")
     monkeypatch.setattr(config, "PROJECTS_DIR", tmp_path / "none")
     assert backfill.backfill() == 0
+
+
+def test_backfill_counts_locked_files_and_exits_nonzero(env, monkeypatch, capsys):
+    from myak.db import DatabaseLocked
+
+    real = backfill.index_transcript_tree
+
+    def flaky(conn, path, *a, **k):
+        if "alpha" in str(path):
+            raise DatabaseLocked("database is locked")
+        return real(conn, path, *a, **k)
+
+    monkeypatch.setattr(backfill, "index_transcript_tree", flaky)
+    assert backfill.backfill() == 3
+    cap = capsys.readouterr()
+    assert "Locked (not indexed" in cap.err and "sess-alpha.jsonl" in cap.err
+    assert "Sessions indexed: 1" in cap.out
+    monkeypatch.setattr(backfill, "index_transcript_tree", real)
+    assert backfill.backfill() == 0

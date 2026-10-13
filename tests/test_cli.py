@@ -80,6 +80,34 @@ def test_index_passthrough(env, capsys):
     assert cli.main(["index"]) == 1  # prints help, exit 1
 
 
+def test_index_database_locked_exits_3(env, monkeypatch, capsys):
+    from myak.db import DatabaseLocked
+
+    t = env.tmp / "s.jsonl"
+    write(t, [rec("u1", "user", text(1)), rec("a1", "assistant", text(2))])
+
+    def locked(*a, **k):
+        raise DatabaseLocked("database is locked")
+
+    monkeypatch.setattr("myak.indexer.index_transcript_tree", locked)
+    assert cli.main(["index", "--file", str(t), "--final"]) == 3
+    assert "database locked" in capsys.readouterr().err
+
+
+def test_backfill_locked_exits_3(env, monkeypatch, capsys):
+    from myak.db import DatabaseLocked
+
+    projects = env.tmp / "projects"
+    write(projects / "-Users-x-p" / "s.jsonl", [rec("u1", "user", text(1))])
+    monkeypatch.setattr(config, "PROJECTS_DIR", projects)
+
+    def locked(*a, **k):
+        raise DatabaseLocked("database is locked")
+
+    monkeypatch.setattr("myak.backfill.index_transcript_tree", locked)
+    assert cli.main(["backfill"]) == 3
+
+
 def test_query_passthrough(env, capsys):
     assert cli.main(["query", "--limit", "2", "nothing matches zzz"]) == 0
     assert capsys.readouterr().out.strip()

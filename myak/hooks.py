@@ -13,7 +13,7 @@ from pathlib import Path
 
 from myak import config
 from myak.config import get_connection
-from myak.db import require_current
+from myak.db import DatabaseLocked, require_current
 from myak.indexer import cwd_to_project_slug, index_transcript_tree, init_db
 
 LOG_MAX_BYTES = 256 * 1024
@@ -141,6 +141,8 @@ def handle_stop(payload):
         return
     try:
         index_transcript_tree(conn, path, _project_slug(payload), final=False)
+    except DatabaseLocked as e:
+        log(f"stop: {e}")
     finally:
         conn.close()
 

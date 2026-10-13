@@ -15,7 +15,7 @@ from myak.config import (
     ensure_memory_dir,
     get_connection,
 )
-from myak.db import create_schema, require_current
+from myak.db import DatabaseLocked, create_schema, is_locked_error, require_current
 from myak.state import clear_cursor, fingerprint, get_cursor, set_cursor
 from myak.transcript import extract_segments as _extract_segments
 from myak.transcript import (
@@ -84,11 +84,12 @@ def _needs_full_rescan(path, cursor, size):
 
 
 def _is_legacy_session(conn, session_id):
-    """desktop- 以外で、行が存在しすべて uuid が NULL のセッションか。"""
+    """desktop- 以外で、本体 (agent_id='') の行が存在しすべて uuid が NULL のセッションか。"""
     if session_id.startswith("desktop-"):
         return False
     row = conn.execute(
-        "SELECT COUNT(*), COUNT(uuid) FROM segments WHERE session_id = ?", (session_id,)
+        "SELECT COUNT(*), COUNT(uuid) FROM segments WHERE session_id = ? AND agent_id = ''",
+        (session_id,),
     ).fetchone()
     return row[0] > 0 and row[1] == 0
 
@@ -118,6 +119,12 @@ def index_session(
     """1 transcript ファイルをインクリメンタルにインデックスする。挿入行数を返す。
 
     session_id 省略時はファイル名 stem。サブエージェントでは親セッション ID を渡す。
+    書き込みロックが取れない場合は DatabaseLocked を送出する (カーソルは進めない)。
+
+    既知の制限 (D2): カーソルの妥当性検査は「サイズ非縮小・先頭 4KB の sha1 一致・
+    カーソル直前のバイトが改行」のみ。先頭 4KB とカーソル位置直前の 1 バイトを保ったまま
+    それより後ろを書き換えるファイルは検知できず、書き換え部分は再索引されない。
+    その場合は `myak reindex --full` を使う。
     """
     jsonl_path = Path(jsonl_path)
     if session_id is None:
@@ -162,15 +169,16 @@ def index_session(
     try:
         conn.execute("BEGIN IMMEDIATE")
     except sqlite3.OperationalError as e:
-        if "locked" in str(e) or "busy" in str(e):
-            print(f"myak: database is locked, skipping {basename}: {e}", file=sys.stderr)
-            return 0
+        if is_locked_error(e):
+            raise DatabaseLocked(f"database is locked, skipping {basename}: {e}") from e
         raise
 
     inserted = 0
     try:
         if start_offset == 0 and agent_id == "" and _is_legacy_session(conn, session_id):
-            conn.execute("DELETE FROM segments WHERE session_id = ?", (session_id,))
+            conn.execute(
+                "DELETE FROM segments WHERE session_id = ? AND agent_id = ''", (session_id,)
+            )
         conn.execute(
             _UPSERT_SESSION,
             (
@@ -196,9 +204,8 @@ def index_session(
         conn.execute("COMMIT")
     except sqlite3.OperationalError as e:
         _rollback(conn)
-        if "locked" in str(e) or "busy" in str(e):
-            print(f"myak: database is locked, skipping {basename}: {e}", file=sys.stderr)
-            return 0
+        if is_locked_error(e):
+            raise DatabaseLocked(f"database is locked, skipping {basename}: {e}") from e
         raise
     except BaseException:
         _rollback(conn)
@@ -273,7 +280,11 @@ def run_from_hook():
                 "(skipping index)", file=sys.stderr,
             )
             return
-        count = index_transcript_tree(conn, jsonl_path, project_slug)
+        try:
+            count = index_transcript_tree(conn, jsonl_path, project_slug)
+        except DatabaseLocked as e:
+            print(f"myak: {e}", file=sys.stderr)
+            return
         if count > 0:
             print(f"Indexed {count} segments from {jsonl_path.name}", file=sys.stderr)
     finally:
@@ -311,7 +322,11 @@ def run_from_cli(argv=None):
         if not require_current(conn):
             print("Database schema is not current; run `myak migrate` first.", file=sys.stderr)
             sys.exit(1)
-        count = index_transcript_tree(conn, jsonl_path, args.project, final=True)
+        try:
+            count = index_transcript_tree(conn, jsonl_path, args.project, final=True)
+        except DatabaseLocked as e:
+            print(f"myak: database locked: {e}", file=sys.stderr)
+            sys.exit(3)
         print(f"Indexed {count} segments from {jsonl_path.name}")
     finally:
         conn.close()

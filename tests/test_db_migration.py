@@ -221,3 +221,52 @@ def test_get_connection_settings(db_env):
         assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
     finally:
         conn.close()
+
+
+def test_create_schema_is_atomic(tmp_path, monkeypatch):
+    conn = sqlite3.connect(str(tmp_path / "a.db"), isolation_level=None)
+    real = db._statements
+
+    def broken(script):
+        stmts = real(script)
+        return stmts[:-1] + ["CREATE TABLE ("]  # 最後の文が壊れている
+
+    monkeypatch.setattr(db, "_statements", broken)
+    with pytest.raises(sqlite3.OperationalError):
+        db.create_schema(conn)
+    assert not conn.in_transaction
+    assert db.schema_version(conn) == 0
+    assert conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0] == 0
+
+
+def test_create_schema_default_isolation_conn(tmp_path):
+    conn = sqlite3.connect(str(tmp_path / "d.db"))
+    db.create_schema(conn)
+    assert db.schema_version(conn) == 1
+    assert not conn.in_transaction
+
+
+def test_post_commit_failure_message_includes_backup_path(v0, tmp_path, monkeypatch):
+    calls = []
+    real = db._check_integrity
+
+    def second_fails(conn):
+        calls.append(1)
+        if len(calls) == 2:
+            raise db.MigrationError("integrity_check failed: boom")
+        real(conn)
+
+    monkeypatch.setattr(db, "_check_integrity", second_fails)
+    with pytest.raises(db.MigrationError) as exc:
+        db.migrate(v0, backup_dir=tmp_path / "bk")
+    msg = str(exc.value)
+    assert "boom" in msg and "backup:" in msg
+    backup = msg.split("backup: ")[1].rstrip(")")
+    assert (tmp_path / "bk") in __import__("pathlib").Path(backup).parents
+
+
+def test_count_mismatch_message_includes_backup_path(v0, tmp_path, monkeypatch):
+    seq = iter([{"sessions": 1, "segments": 1}, {"sessions": 2, "segments": 2}])
+    monkeypatch.setattr(db, "_counts", lambda c: next(seq))
+    with pytest.raises(db.MigrationError, match=r"backup: .*\.bak-v0-"):
+        db.migrate(v0, backup_dir=tmp_path / "bk")

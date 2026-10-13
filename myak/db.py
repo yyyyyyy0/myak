@@ -73,6 +73,15 @@ class SchemaTooNew(RuntimeError):
     """DB の user_version がこのコードより新しい。"""
 
 
+class DatabaseLocked(Exception):
+    """書き込みロックを取得できなかった (他プロセスが保持中)。再試行可能。"""
+
+
+def is_locked_error(exc):
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
+
+
 class MigrationError(RuntimeError):
     """マイグレーション前後の検証に失敗した。"""
 
@@ -95,11 +104,29 @@ def _has_table(conn, name):
     )
 
 
+def _statements(script):
+    """DDL スクリプトを 1 文ずつに分割する (トリガ本体の ; を考慮)。"""
+    out = []
+    buf = ""
+    for line in script.splitlines(keepends=True):
+        buf += line
+        if sqlite3.complete_statement(buf):
+            if buf.strip():
+                out.append(buf.strip())
+            buf = ""
+    if buf.strip():
+        out.append(buf.strip())
+    return out
+
+
 def create_schema(conn):
-    """新規 DB を v1 で直接作成する。既存 DB (v0/v1) には何もしない。"""
+    """新規 DB を v1 で直接作成する。既存 DB (v0/v1) には何もしない。
+
+    DDL と user_version は 1 つの BEGIN IMMEDIATE ... COMMIT で原子的に実行する。
+    """
     if _has_table(conn, "segments"):
         return
-    conn.executescript(
+    script = (
         _V0_TABLES.format(
             sessions_extra=",\n        cwd TEXT",
             segments_extra=(
@@ -112,7 +139,19 @@ def create_schema(conn):
         + _UUID_INDEX
         + ";"
     )
-    conn.execute(f"PRAGMA user_version={CURRENT_VERSION}")
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if not _has_table(conn, "segments"):  # 待機中に他プロセスが作成した場合
+            for stmt in _statements(script):
+                conn.execute(stmt)
+            conn.execute(f"PRAGMA user_version={CURRENT_VERSION}")
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
 
 
 def _exec(conn, sql):
@@ -144,7 +183,13 @@ def _counts(conn):
 
 
 def migrate(conn, *, backup_dir=None):
-    """v0 → v1。明示的にのみ呼ぶ。結果 dict を返す。"""
+    """v0 → v1。明示的にのみ呼ぶ。結果 dict を返す。
+
+    バックアップは BEGIN IMMEDIATE の前に取る (バックアップ中も他プロセスの書き込みを
+    止めないため)。バックアップ後〜ロック取得前の書き込みはバックアップに含まれないが、
+    migration 自体は行を変更しないので影響しない。コミット後の検証に失敗した場合は
+    MigrationError にバックアップのパスを含める。
+    """
     version = schema_version(conn)
     if version > CURRENT_VERSION:
         raise SchemaTooNew(
@@ -188,10 +233,13 @@ def migrate(conn, *, backup_dir=None):
             conn.execute("ROLLBACK")
         raise
 
-    _check_integrity(conn)
-    after = _counts(conn)
-    if after != before:
-        raise MigrationError(f"row counts changed: {before} -> {after}")
+    try:
+        _check_integrity(conn)
+        after = _counts(conn)
+        if after != before:
+            raise MigrationError(f"row counts changed: {before} -> {after}")
+    except MigrationError as e:
+        raise MigrationError(f"{e} (backup: {backup_path})") from e
     return {
         "status": "migrated",
         "from": version,

@@ -184,17 +184,17 @@ def test_null_role_raises_and_rolls_back(env):
     assert not env.conn.in_transaction
 
 
-def test_locked_db_returns_zero_and_logs(env, capsys):
+def test_locked_db_raises_database_locked(env):
     p = write(env.tmp / "s1.jsonl", base_records(2))
     env.conn.execute("PRAGMA busy_timeout=50")
     other = sqlite3.connect(str(env.db_path), isolation_level=None)
     other.execute("BEGIN IMMEDIATE")
     try:
-        assert indexer.index_session(env.conn, p) == 0
+        with pytest.raises(indexer.DatabaseLocked):
+            indexer.index_session(env.conn, p)
     finally:
         other.execute("ROLLBACK")
         other.close()
-    assert "locked" in capsys.readouterr().err
     assert env.state.get_cursor(p) is None
     assert indexer.index_session(env.conn, p) == 2
 
@@ -310,3 +310,71 @@ def test_fixture_session_basic(env, fixtures_dir):
 
 def test_fixtures_dir_exists():
     assert FIXTURES.is_dir()
+
+
+def test_lock_during_insert_raises_and_rolls_back(env, monkeypatch):
+    p = write(env.tmp / "s1.jsonl", base_records(2))
+
+    class ConnProxy:
+        def __init__(self, conn):
+            self._c = conn
+
+        def execute(self, sql, *a):
+            if sql.startswith("INSERT INTO segments"):
+                raise sqlite3.OperationalError("database is locked")
+            return self._c.execute(sql, *a)
+
+        def __getattr__(self, name):
+            return getattr(self._c, name)
+
+    with pytest.raises(indexer.DatabaseLocked):
+        indexer.index_session(ConnProxy(env.conn), p)
+    assert count(env.conn) == 0
+    assert env.state.get_cursor(p) is None
+    assert not env.conn.in_transaction
+
+
+def test_other_operational_error_propagates(env):
+    p = write(env.tmp / "s1.jsonl", base_records(2))
+
+    class ConnProxy:
+        def __init__(self, conn):
+            self._c = conn
+
+        def execute(self, sql, *a):
+            if sql.startswith("INSERT INTO segments"):
+                raise sqlite3.OperationalError("disk I/O error")
+            return self._c.execute(sql, *a)
+
+        def __getattr__(self, name):
+            return getattr(self._c, name)
+
+    with pytest.raises(sqlite3.OperationalError):
+        indexer.index_session(ConnProxy(env.conn), p)
+
+
+def test_legacy_replaced_even_when_subagent_rows_exist(env):
+    _legacy_session(env, "s1", ["legacy main row one long enough"])
+    env.conn.execute(
+        "INSERT INTO segments(session_id, role, content, uuid, agent_id, agent_type) "
+        "VALUES ('s1','user','subagent row kept','sub-u1','a1','Explore')"
+    )
+    p = write(env.tmp / "s1.jsonl", base_records(2))
+    assert indexer.index_session(env.conn, p) == 2
+    assert count(env.conn, where="content LIKE 'legacy main row%'") == 0
+    assert count(env.conn, where="agent_id='a1'") == 1
+    assert count(env.conn, where="agent_id='' AND uuid IS NULL") == 0
+
+
+def test_known_limitation_prefix_preserving_rewrite_not_detected(env):
+    """D2 の既知の制限: 先頭 4KB と直前 1 バイトが同じ書き換えは検知されない。"""
+    recs = [rec(f"u{i:03d}", "user", text(i)) for i in range(80)]
+    p = write(env.tmp / "s1.jsonl", recs)
+    assert p.stat().st_size > 8192
+    assert indexer.index_session(env.conn, p) == 80
+    rewritten = list(recs)
+    rewritten[60] = rec("u060", "user", text(60, "y"))  # 同じ長さ・4KB より後ろ
+    write(p, rewritten)
+    append(p, [rec("u080", "user", text(80))])
+    assert indexer.index_session(env.conn, p) == 1
+    assert count(env.conn, where="content LIKE '%number 60 y:%'") == 0
