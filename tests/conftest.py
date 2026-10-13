@@ -38,3 +38,13 @@ def db_env(tmp_path, monkeypatch):
     monkeypatch.setattr(myak.query, "DB_PATH", db_path)
     monkeypatch.setattr(myak.export_obsidian, "DB_PATH", db_path)
     return SimpleNamespace(memory_dir=memory_dir, db_path=db_path)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_state_dir(tmp_path_factory, monkeypatch):
+    """実機の ~/.claude/myak-state を絶対に触らない。"""
+    import myak.config
+
+    state_dir = tmp_path_factory.mktemp("autostate") / "myak-state"
+    monkeypatch.setattr(myak.config, "STATE_DIR", state_dir)
+    monkeypatch.setattr(myak.config, "STATE_DB_PATH", state_dir / "state.db")

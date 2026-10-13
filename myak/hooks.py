@@ -1,6 +1,6 @@
 """Claude Code hook ハンドラ。
 
-契約: 例外を外に出さない。常に exit 0。失敗は MEMORY_DIR/hook.log に 1 行ずつ記録する。
+契約: 例外を外に出さない。常に exit 0。失敗は STATE_DIR/hook.log に 1 行ずつ記録する。
 """
 
 import json
@@ -21,17 +21,27 @@ LOG_BACKUP_COUNT = 1
 TAIL_BYTES = 64 * 1024
 NEEDLE_CHARS = 80
 RETRY_SLEEP = 0.5
+LOG_MESSAGE_CHARS = 200
 SCHEMA_MESSAGE = "database schema is not current; run `myak migrate` (hooks do not index)"
 
 EVENTS = ("stop", "session-end", "session-start", "prompt")
 
 
+class _PrivateRotatingFileHandler(RotatingFileHandler):
+    """ログファイルを作成直後に 0600 にする。"""
+
+    def _open(self):
+        stream = super()._open()
+        config.secure_file(self.baseFilename)
+        return stream
+
+
 def log(message):
     """hook.log に 1 行追記する (ローテーション付き)。ログ失敗は握りつぶす。"""
     try:
-        config.MEMORY_DIR.mkdir(parents=True, exist_ok=True)
-        handler = RotatingFileHandler(
-            str(config.MEMORY_DIR / "hook.log"),
+        config.ensure_state_dir()
+        handler = _PrivateRotatingFileHandler(
+            str(config.STATE_DIR / "hook.log"),
             maxBytes=LOG_MAX_BYTES,
             backupCount=LOG_BACKUP_COUNT,
             encoding="utf-8",
@@ -42,7 +52,7 @@ def log(message):
         logger.setLevel(logging.INFO)
         logger.addHandler(handler)
         try:
-            logger.info(" ".join(str(message).split()))
+            logger.info(" ".join(str(message).split())[:LOG_MESSAGE_CHARS])
         finally:
             logger.removeHandler(handler)
             handler.close()
@@ -59,8 +69,9 @@ def _log_schema_once():
     try:
         if marker.exists():
             return
-        marker.parent.mkdir(parents=True, exist_ok=True)
+        config.ensure_state_dir()
         marker.write_text("1")
+        config.secure_file(marker)
     except OSError:
         pass
     log(SCHEMA_MESSAGE)
@@ -155,8 +166,10 @@ def handle_session_end(payload):
     if conn is None:
         return
     conn.close()
-    # -I: PYTHON* 環境変数/ユーザー site/cwd を無視。--file=: '-' 始まりのパスをオプション扱いさせない
-    cmd = [sys.executable, "-I", "-m", "myak.cli", "index", f"--file={path}", "--final"]
+    # -I: PYTHON* env/user site/cwd を無視。--file=: '-' 始まりのパスを option 扱いさせない
+    cmd = [
+        sys.executable, "-I", "-m", "myak.cli", "index", f"--file={path}", "--final",
+    ]
     slug = _project_slug(payload)
     if slug:
         cmd += ["--project", slug]

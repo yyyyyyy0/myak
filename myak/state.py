@@ -1,6 +1,7 @@
 """機械ローカルのインクリメンタル索引カーソル (同期対象外の別 SQLite)。"""
 
 import hashlib
+import os
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
@@ -12,7 +13,10 @@ FINGERPRINT_BYTES = 4096
 
 def _connect():
     path = config.STATE_DB_PATH
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not path.exists():
+        os.close(os.open(str(path), os.O_WRONLY | os.O_CREAT, 0o600))
+    config.secure_file(path)
     conn = sqlite3.connect(str(path), isolation_level=None, timeout=5)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS cursors ("

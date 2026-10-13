@@ -154,14 +154,17 @@ def test_migrate_dry_run_and_real(env, capsys):
     assert c.execute("PRAGMA user_version").fetchone()[0] == 0
     c.close()
     assert not list(env.memory_dir.glob("*.bak-*"))
+    assert not list((env.tmp / "state").glob("backups/*"))
 
     assert cli.main(["migrate"]) == 0
     out = capsys.readouterr().out
     assert "Counts before: {'sessions': 3, 'segments': 5}" in out
     assert "Counts after: {'sessions': 3, 'segments': 5}" in out
-    backups = list(env.memory_dir.glob("memory.db.bak-v0-*"))
+    backups = list((env.tmp / "state" / "backups").glob("memory.db.bak-v0-*"))
     assert len(backups) == 1
+    assert not list(env.memory_dir.glob("*.bak-*"))
     assert str(backups[0]) in out
+    assert oct(backups[0].stat().st_mode & 0o777) == "0o600"
     c = sqlite3.connect(str(env.db_path))
     assert c.execute("PRAGMA user_version").fetchone()[0] == 1
     c.close()
@@ -237,12 +240,16 @@ def test_reindex_full_resets_cursors(env, monkeypatch, capsys):
 def test_install_hooks(env, capsys):
     assert cli.main(["install-hooks"]) == 0
     out = capsys.readouterr().out
-    dest = env.memory_dir / "bin" / "myak-hook"
+    dest = env.tmp / "state" / "bin" / "myak-hook"
     assert dest.is_file()
     assert dest.stat().st_mode & stat.S_IXUSR
     assert oct(dest.stat().st_mode & 0o777) == "0o755"
     assert dest.read_text() == LAUNCHER.read_text()
-    assert (env.tmp / "state" / "venv-python").read_text().strip()
+    venv = env.tmp / "state" / "venv-python"
+    assert venv.read_text().strip()
+    assert oct(venv.stat().st_mode & 0o777) == "0o600"
+    assert oct((env.tmp / "state").stat().st_mode & 0o777) == "0o700"
+    assert not (env.memory_dir / "bin").exists()
     snippet = json.loads(out[out.index("{"):])
     hooks = snippet["hooks"]
     assert set(hooks) == {"Stop", "SessionEnd", "UserPromptSubmit"}
@@ -254,6 +261,17 @@ def test_install_hooks(env, capsys):
     }
     assert hooks["SessionEnd"][0]["hooks"][0]["timeout"] == 10
     assert all("matcher" not in g for groups in hooks.values() for g in groups)
+
+
+def test_install_hooks_replaces_symlink_without_following(env):
+    victim = env.tmp / "victim.txt"
+    victim.write_text("keep")
+    dest = env.tmp / "state" / "bin" / "myak-hook"
+    dest.parent.mkdir(parents=True)
+    dest.symlink_to(victim)
+    assert cli.main(["install-hooks"]) == 0
+    assert not dest.is_symlink() and dest.read_text() == LAUNCHER.read_text()
+    assert victim.read_text() == "keep"
 
 
 def test_install_hooks_missing_templates(env, monkeypatch, capsys):

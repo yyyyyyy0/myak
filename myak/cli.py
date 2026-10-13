@@ -2,8 +2,6 @@
 
 import argparse
 import json
-import os
-import stat
 import sys
 from pathlib import Path
 
@@ -48,7 +46,7 @@ def build_parser():
     ms.add_argument("--dry-run", action="store_true", help="Print a diff, change nothing")
     ms.add_argument("--path", help="settings.json path (default: ~/.claude/settings.json)")
     ms.add_argument(
-        "--launcher", help="Launcher path for rewrite (default: MEMORY_DIR/bin/myak-hook)"
+        "--launcher", help="Launcher path for rewrite (default: STATE_DIR/bin/myak-hook)"
     )
 
     return parser
@@ -127,7 +125,7 @@ def cmd_reindex(full):
 
 
 def hook_launcher_path():
-    return config.MEMORY_DIR / "bin" / "myak-hook"
+    return config.STATE_DIR / "bin" / "myak-hook"
 
 
 def cmd_install_hooks():
@@ -136,14 +134,12 @@ def cmd_install_hooks():
     if not launcher_src.is_file() or not hooks_src.is_file():
         print(f"Templates not found under {TEMPLATES_DIR}", file=sys.stderr)
         return 1
+    config.ensure_state_dir()
     dest = hook_launcher_path()
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(launcher_src.read_text(encoding="utf-8"), encoding="utf-8")
-    os.chmod(dest, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+    config.atomic_write(dest, launcher_src.read_text(encoding="utf-8"), 0o755)
 
     venv_file = config.STATE_DIR / "venv-python"
-    venv_file.parent.mkdir(parents=True, exist_ok=True)
-    venv_file.write_text(sys.executable + "\n", encoding="utf-8")
+    config.atomic_write(venv_file, sys.executable + "\n", 0o600)
 
     hooks = json.loads(hooks_src.read_text(encoding="utf-8").replace(HOOK_PLACEHOLDER, str(dest)))
     print(f"Launcher: {dest}")

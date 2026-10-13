@@ -6,7 +6,7 @@ import stat
 
 import pytest
 
-from myak import cli, settings_migrate
+from myak import cli, config, settings_migrate
 from myak.settings_migrate import is_myak_hook, migrate_settings
 
 LAUNCHER = "/home/u/.claude/memory/bin/myak-hook"
@@ -278,7 +278,7 @@ def test_cli_dry_run_then_real(settings, capsys):
 
 def test_cli_rewrite_defaults_launcher(settings, db_env, capsys):
     assert cli.main(["migrate-settings", "--mode", "rewrite", "--path", str(settings)]) == 0
-    assert str(db_env.memory_dir / "bin" / "myak-hook") in settings.read_text()
+    assert str(config.STATE_DIR / "bin" / "myak-hook") in settings.read_text()
 
 
 def test_cli_error_on_bad_json(tmp_path, capsys):

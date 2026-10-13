@@ -146,6 +146,24 @@ def test_migrate_custom_backup_dir(v0, tmp_path):
     assert result["backup"].startswith(str(tmp_path / "bk"))
 
 
+def test_migrate_default_backup_in_state_dir_0600_and_pruned(tmp_path, monkeypatch):
+    from myak import config
+
+    state = tmp_path / "st"
+    monkeypatch.setattr(config, "STATE_DIR", state)
+    for i in range(5):
+        path = tmp_path / f"d{i}" / "memory.db"
+        path.parent.mkdir()
+        conn = make_v0(path)
+        conn.isolation_level = None
+        result = db.migrate(conn)
+        conn.close()
+        assert result["backup"].startswith(str(state / "backups"))
+        assert oct(__import__("os").stat(result["backup"]).st_mode & 0o777) == "0o600"
+        __import__("time").sleep(0.01)
+    assert len(list((state / "backups").glob("memory.db.bak-v0-*"))) == db.KEEP_BACKUPS
+
+
 def test_migrate_idempotent(v0):
     db.migrate(v0)
     again = db.migrate(v0)

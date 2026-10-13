@@ -3,11 +3,13 @@
 マイグレーションは `migrate()` からのみ実行する (hook は自動 migrate しない)。
 """
 
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
 CURRENT_VERSION = 1
+KEEP_BACKUPS = 3
 
 _V0_TABLES = """
     CREATE TABLE IF NOT EXISTS sessions (
@@ -182,6 +184,18 @@ def _counts(conn):
     }
 
 
+def _prune_backups(dest_dir, db_name, keep=KEEP_BACKUPS):
+    """古いバックアップを削除し、新しい順に keep 個だけ残す。"""
+    files = sorted(
+        dest_dir.glob(f"{db_name}.bak-v*"), key=lambda p: (p.stat().st_mtime_ns, p.name)
+    )
+    for old in files[:-keep]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
 def migrate(conn, *, backup_dir=None):
     """v0 → v1。明示的にのみ呼ぶ。結果 dict を返す。
 
@@ -212,15 +226,22 @@ def migrate(conn, *, backup_dir=None):
     backup_path = None
     db_file = _db_file(conn)
     if db_file is not None:
-        dest_dir = Path(backup_dir) if backup_dir is not None else db_file.parent
-        dest_dir.mkdir(parents=True, exist_ok=True)
+        if backup_dir is not None:
+            dest_dir = Path(backup_dir)
+        else:
+            from myak import config
+
+            dest_dir = config.ensure_state_dir() / "backups"
+        dest_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         backup_path = dest_dir / f"{db_file.name}.bak-v{version}-{stamp}"
+        os.close(os.open(str(backup_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
         dest = sqlite3.connect(str(backup_path))
         try:
             conn.backup(dest)
         finally:
             dest.close()
+        _prune_backups(dest_dir, db_file.name)
 
     conn.execute("BEGIN IMMEDIATE")
     try:

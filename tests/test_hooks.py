@@ -20,7 +20,7 @@ def env(db_env, tmp_path, monkeypatch):
     e.conn.close()
     e.transcript = tmp_path / "projects" / "-Users-x-proj" / "sess-1.jsonl"
     write(e.transcript, [rec("u1", "user", text(1)), rec("a1", "assistant", text(2))])
-    e.log = db_env.memory_dir / "hook.log"
+    e.log = tmp_path / "state" / "hook.log"
     return e
 
 
@@ -188,11 +188,33 @@ def test_log_rotates(env, monkeypatch):
     monkeypatch.setattr(hooks, "LOG_MAX_BYTES", 300)
     for i in range(30):
         hooks.log(f"line {i} " + "x" * 50)
-    assert (env.memory_dir / "hook.log.1").exists()
-    assert not (env.memory_dir / "hook.log.2").exists()
+    assert (env.log.parent / "hook.log.1").exists()
+    assert not (env.log.parent / "hook.log.2").exists()
 
 
 def test_log_failure_is_swallowed(env, monkeypatch):
-    monkeypatch.setattr(config, "MEMORY_DIR", env.tmp / "file")
+    monkeypatch.setattr(config, "STATE_DIR", env.tmp / "file")
     (env.tmp / "file").write_text("not a dir")
     hooks.log("anything")  # must not raise
+
+
+def test_log_file_mode_dir_mode_and_truncation(env):
+    hooks.log("x" * 1000)
+    assert oct(env.log.stat().st_mode & 0o777) == "0o600"
+    assert oct(env.log.parent.stat().st_mode & 0o777) == "0o700"
+    line = env.log.read_text().strip()
+    assert len(line.split(" ", 2)[2]) == hooks.LOG_MESSAGE_CHARS
+
+
+def test_hook_log_not_in_memory_dir(env):
+    hooks.log("hello")
+    assert not (env.memory_dir / "hook.log").exists()
+
+
+def test_schema_marker_in_state_dir_0600(env):
+    env.db_path.unlink()
+    make_v0(env.db_path).close()
+    hooks.dispatch("stop", payload(env))
+    marker = env.log.parent / "schema-warned"
+    assert marker.exists() and oct(marker.stat().st_mode & 0o777) == "0o600"
+    assert not (env.memory_dir / "schema-warned").exists()

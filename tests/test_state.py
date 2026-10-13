@@ -56,3 +56,10 @@ def test_fingerprint(tmp_path):
 def test_state_dir_default_in_config():
     assert config.STATE_DIR.name  # defined
     assert config.STATE_DB_PATH.parent == config.STATE_DIR
+
+
+def test_state_db_mode_0600_and_dir_0700(state_env):
+    state.set_cursor("/x.jsonl", 1, 1, "a")
+    db = state_env / "st" / "state.db"
+    assert oct(db.stat().st_mode & 0o777) == "0o600"
+    assert oct(db.parent.stat().st_mode & 0o777) == "0o700"
