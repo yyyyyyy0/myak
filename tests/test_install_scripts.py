@@ -58,8 +58,7 @@ def test_install_call_sequence(sandbox):
     assert r.returncode == 0, r.stderr
     calls = _calls(log)
     assert calls == [
-        "uv tool list",
-        f"uv tool install --editable {REPO} --python 3.12",
+        f"uv tool install {REPO} --python 3.12 --force",
         "myak install-hooks",
         f"claude plugin marketplace add {REPO}",
         "claude plugin install myak@myak",
@@ -69,12 +68,43 @@ def test_install_call_sequence(sandbox):
     assert not any("migrate-settings" in c for c in calls)
 
 
-def test_install_reinstalls_when_already_installed(sandbox):
+def test_install_editable_opt_in(sandbox):
     home, stubs, log = sandbox
-    _stub(stubs / "uv", "uv", log, extra='[ "$1 $2" = "tool list" ] && echo "myak v0.2.0"\n')
+    r = _run(INSTALL, home, stubs, {"MYAK_EDITABLE": "1"})
+    assert r.returncode == 0, r.stderr
+    assert f"uv tool install --editable {REPO} --python 3.12 --force" in _calls(log)
+    assert "must stay in place" in r.stdout
+
+
+def test_install_warns_about_duplicate_injection(sandbox):
+    home, stubs, log = sandbox
+    r = _run(INSTALL, home, stubs)
+    assert "TWICE" in r.stdout
+    assert "myak migrate-settings --mode remove" in r.stdout
+
+
+def test_install_tolerates_claude_and_backfill_failures(sandbox):
+    home, stubs, log = sandbox
+    _stub(stubs / "claude", "claude", log, extra="exit 1\n")
+    _stub(home / ".local" / "bin" / "myak", "myak", log,
+          extra='[ "$1" = "backfill" ] && exit 1\n')
     r = _run(INSTALL, home, stubs)
     assert r.returncode == 0, r.stderr
-    assert f"uv tool install --editable {REPO} --python 3.12 --reinstall" in _calls(log)
+    assert "marketplace already added" in r.stdout
+    assert "plugin already installed" in r.stdout
+    assert "WARN: backfill failed" in r.stdout
+
+
+def test_alias_step_is_opt_in(sandbox):
+    home, stubs, log = sandbox
+    zshrc = home / ".zshrc"
+    zshrc.write_text("# rc\n")
+    r = _run(INSTALL, home, stubs)
+    assert r.returncode == 0, r.stderr
+    assert "claude-reload" not in zshrc.read_text()
+    r = _run(INSTALL, home, stubs, {"MYAK_SHELL_ALIAS": "1"})
+    assert r.returncode == 0, r.stderr
+    assert "claude-reload" in zshrc.read_text()
 
 
 def test_install_removes_settings_hooks_when_opted_in(sandbox):

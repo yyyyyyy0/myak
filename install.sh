@@ -17,10 +17,11 @@ if ! command -v uv >/dev/null 2>&1; then
     echo "  Install it: curl -LsSf https://astral.sh/uv/install.sh | sh   (or: brew install uv)" >&2
     exit 1
 fi
-if uv tool list 2>/dev/null | grep -q '^myak '; then
-    uv tool install --editable "$SCRIPT_DIR" --python 3.12 --reinstall
+if [ "${MYAK_EDITABLE:-}" = "1" ]; then
+    echo "  WARNING: editable install; the clone at $SCRIPT_DIR must stay in place."
+    uv tool install --editable "$SCRIPT_DIR" --python 3.12 --force
 else
-    uv tool install --editable "$SCRIPT_DIR" --python 3.12
+    uv tool install "$SCRIPT_DIR" --python 3.12 --force
 fi
 if [ ! -x "$MYAK_SHIM" ]; then
     MYAK_SHIM="$(command -v myak || true)"
@@ -35,8 +36,8 @@ echo "[2/6] Installing hook launcher..."
 # 3. Claude Code plugin
 echo "[3/6] Claude Code plugin..."
 if command -v claude >/dev/null 2>&1; then
-    claude plugin marketplace add "$SCRIPT_DIR"
-    claude plugin install myak@myak
+    claude plugin marketplace add "$SCRIPT_DIR" || echo "  marketplace already added"
+    claude plugin install myak@myak || echo "  plugin already installed (try: claude plugin update myak@myak)"
 else
     echo "  'claude' CLI not found. Run these when it is available:"
     echo "    claude plugin marketplace add \"$SCRIPT_DIR\""
@@ -48,8 +49,9 @@ echo "[4/6] Legacy settings.json hooks..."
 if [ "${MYAK_REMOVE_SETTINGS_HOOKS:-}" = "1" ]; then
     "$MYAK_SHIM" migrate-settings --mode remove
 else
-    echo "  Kept as is. After verifying the plugin works, remove the old hooks with:"
-    echo "    myak migrate-settings --mode remove      (preview: add --dry-run)"
+    echo "  WARNING: legacy settings.json hooks were left in place. While they coexist"
+    echo "  with the plugin, UserPromptSubmit injects context TWICE."
+    echo "  Remove them with:  myak migrate-settings --mode remove      (preview: add --dry-run)"
     echo "  Or re-run with MYAK_REMOVE_SETTINGS_HOOKS=1."
 fi
 
@@ -80,7 +82,9 @@ fi
 # 6. Shell alias
 echo "[6/6] Shell alias..."
 ZSHRC="$HOME/.zshrc"
-if [ -f "$ZSHRC" ] && ! grep -q 'claude-reload' "$ZSHRC" 2>/dev/null; then
+if [ "${MYAK_SHELL_ALIAS:-}" != "1" ]; then
+    echo "  Skipped (opt in with MYAK_SHELL_ALIAS=1 to add the claude-reload alias)."
+elif [ -f "$ZSHRC" ] && ! grep -q 'claude-reload' "$ZSHRC" 2>/dev/null; then
     cat >> "$ZSHRC" << 'ALIAS'
 
 # myak: reload Claude Code settings across all tmux panes
@@ -94,7 +98,7 @@ fi
 echo ""
 echo "Existing database? Preview the schema migration first:  myak migrate --dry-run"
 echo "Running initial backfill..."
-"$MYAK_SHIM" backfill
+"$MYAK_SHIM" backfill || echo "WARN: backfill failed; run 'myak backfill' later"
 
 echo ""
 echo "=== Done ==="
