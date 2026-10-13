@@ -1,14 +1,12 @@
 """myak.vec: sqlite-vec / 埋め込み (FakeEmbedder)。"""
 
 import sqlite3
-import sys
-import types
 from datetime import datetime, timezone
 
 import pytest
 
 from myak import config, db, vec
-from tests.fakes import FakeEmbedder
+from tests.fakes import FakeEmbedder, install_fake_fastembed
 
 pytest.importorskip("sqlite_vec")
 
@@ -74,11 +72,53 @@ def test_vector_candidates_finds_synonym(conn):
     assert len(top) == 2
 
 
-def test_model_mismatch_recreates_table(conn):
+def test_model_mismatch_recreates_table_only_with_flag(conn):
     vec.embed_pending(conn, FakeEmbedder("model-a"))
-    assert vec.embed_pending(conn, FakeEmbedder("model-b")) == 3
+    with pytest.raises(vec.VecUnavailable, match="model mismatch"):
+        vec.embed_pending(conn, FakeEmbedder("model-b"))
+    assert conn.execute("SELECT model_id FROM vec.embedding_meta").fetchall() == [("model-a",)]
+    assert conn.execute("SELECT COUNT(*) FROM vec.segments_vec").fetchone()[0] == 3
+    assert vec.embed_pending(conn, FakeEmbedder("model-b"), allow_rebuild=True) == 3
     meta = conn.execute("SELECT model_id FROM vec.embedding_meta").fetchall()
     assert meta == [("model-b",)]
+
+
+def test_search_path_never_mutates_vec_db(conn):
+    vec.embed_pending(conn, FakeEmbedder("model-a"))
+    before = config.VEC_DB_PATH.read_bytes()
+    with pytest.raises(vec.VecUnavailable, match="model mismatch"):
+        vec.vector_candidates(conn, FakeEmbedder("model-b"), "vehicle")
+    assert conn.execute("SELECT COUNT(*) FROM vec.segments_vec").fetchone()[0] == 3
+    assert vec.vector_candidates(conn, FakeEmbedder("model-a"), "vehicle")
+    assert config.VEC_DB_PATH.read_bytes() == before
+
+
+def test_extension_loading_is_switched_off_after_open(conn):
+    vec.embed_pending(conn, FakeEmbedder())
+    with pytest.raises(sqlite3.OperationalError):
+        conn.execute("SELECT load_extension('nonexistent')")
+
+
+def test_cosine_distance_orders_and_is_bounded(conn):
+    emb = FakeEmbedder()
+    vec.embed_pending(conn, emb)
+    top = vec.vector_candidates(conn, emb, "vehicle", k=3)
+    assert top[0][0] == 1 and top[0][1] < top[1][1] < config.VEC_MAX_DISTANCE + 1
+    assert all(0 <= d <= 2 for _, d in top)
+
+
+def test_corrupt_vec_db_is_unavailable(conn):
+    config.VEC_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    config.VEC_DB_PATH.write_bytes(bytes(range(256)) * 40)
+    with pytest.raises(vec.VecUnavailable):
+        vec.vector_candidates(conn, FakeEmbedder(), "vehicle")
+
+
+def test_embed_pending_streams_pages_and_respects_limit(conn):
+    emb = FakeEmbedder()
+    assert vec.embed_pending(conn, emb, batch=1, limit=2) == 2
+    assert conn.execute("SELECT COUNT(*) FROM vec.segments_vec").fetchone()[0] == 2
+    assert vec.embed_pending(conn, emb, batch=1) == 1
 
 
 def test_vec_db_is_separate_file(conn):
@@ -87,81 +127,10 @@ def test_vec_db_is_separate_file(conn):
     assert config.VEC_DB_PATH != config.DB_PATH
 
 
-def test_disabled_env(conn, monkeypatch):
-    monkeypatch.setenv("MYAK_DISABLE_VEC", "1")
-    with pytest.raises(vec.VecUnavailable):
-        vec.open_vec(conn, FakeEmbedder())
-    with pytest.raises(vec.VecUnavailable):
-        vec.default_embedder()
 
 
-def test_missing_sqlite_vec_raises(conn, monkeypatch):
-    monkeypatch.setitem(sys.modules, "sqlite_vec", None)
-    with pytest.raises(vec.VecUnavailable):
-        vec.open_vec(conn, FakeEmbedder())
 
 
-def test_no_load_extension_support(monkeypatch):
-    class Bare:
-        pass
-
-    with pytest.raises(vec.VecUnavailable):
-        vec._load_extension(Bare())
-
-
-def test_extension_load_error(monkeypatch):
-    class Boom:
-        def enable_load_extension(self, flag):
-            raise sqlite3.OperationalError("not authorized")
-
-    with pytest.raises(vec.VecUnavailable):
-        vec._load_extension(Boom())
-
-
-def test_models_cached_and_default_embedder(monkeypatch):
-    assert not vec.models_cached("a/b")
-    with pytest.raises(vec.VecUnavailable):
-        vec.default_embedder()
-    d = config.MODELS_DIR / "models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2"
-    d.mkdir(parents=True)
-    assert vec.models_cached(config.VEC_MODEL)
-    assert isinstance(vec.default_embedder(), vec.FastEmbedEmbedder)
-
-
-def _fake_fastembed(monkeypatch, fail=False):
-    calls = {}
-
-    class TextEmbedding:
-        def __init__(self, **kwargs):
-            if fail:
-                raise RuntimeError("no model")
-            calls.update(kwargs)
-
-        def embed(self, texts):
-            return ([1, 2, 3] for _ in texts)
-
-    mod = types.ModuleType("fastembed")
-    mod.TextEmbedding = TextEmbedding
-    monkeypatch.setitem(sys.modules, "fastembed", mod)
-    return calls
-
-
-def test_fastembed_embedder_with_mock(monkeypatch):
-    calls = _fake_fastembed(monkeypatch)
-    e = vec.FastEmbedEmbedder(local_files_only=True)
-    assert e.dim == 384
-    assert e.embed(["a", "b"]) == [[1.0, 2.0, 3.0]] * 2
-    assert calls["local_files_only"] is True
-    assert vec.FastEmbedEmbedder(model_id="other/model").dim == 3
-
-
-def test_fastembed_failures(monkeypatch):
-    _fake_fastembed(monkeypatch, fail=True)
-    with pytest.raises(vec.VecUnavailable):
-        vec.FastEmbedEmbedder().embed(["x"])
-    monkeypatch.setitem(sys.modules, "fastembed", None)
-    with pytest.raises(vec.VecUnavailable):
-        vec.FastEmbedEmbedder().embed(["x"])
 
 
 def test_try_embed_pending(db_env, conn, monkeypatch):
@@ -171,9 +140,6 @@ def test_try_embed_pending(db_env, conn, monkeypatch):
     assert vec.try_embed_pending() == (3, None)
     assert vec.try_embed_pending() == (0, None)
 
-
-def test_try_embed_pending_no_db(db_env):
-    assert vec.try_embed_pending() == (0, "no database")
 
 
 def test_try_embed_pending_generic_failure(conn, monkeypatch):
@@ -185,27 +151,66 @@ def test_try_embed_pending_generic_failure(conn, monkeypatch):
     assert n == 0 and "embed failed" in reason
 
 
-def test_run_embed_without_extra_exits_2(monkeypatch, capsys):
-    monkeypatch.setitem(sys.modules, "fastembed", None)
-    assert vec.run_embed() == 2
-    assert "myak[vec]" in capsys.readouterr().err
 
 
-def test_run_embed_disabled(monkeypatch):
-    monkeypatch.setenv("MYAK_DISABLE_VEC", "1")
-    assert vec.run_embed() == 2
+def _patch_fastembed(monkeypatch):
+    install_fake_fastembed(monkeypatch)
+    monkeypatch.setattr(
+        vec, "FastEmbedEmbedder", lambda model_id=None, **kw: FakeEmbedder(model_id)
+    )
 
 
-def test_run_embed_success_and_cli(conn, monkeypatch, capsys):
+def test_run_embed_success_cli_and_marker(conn, monkeypatch, capsys):
     from myak import cli
 
-    _fake_fastembed(monkeypatch)
-    monkeypatch.setattr(vec, "FastEmbedEmbedder", lambda model_id=None: FakeEmbedder(model_id))
-    monkeypatch.setattr(config, "VEC_MODEL", "fake-model")
-    assert cli.main(["embed", "--limit", "2", "--model", "fake-model"]) == 0
+    _patch_fastembed(monkeypatch)
+    model = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    monkeypatch.setitem(vec.KNOWN_DIMS, model, 8)
+    assert not vec.models_cached(model)
+    assert cli.main(["embed", "--limit", "2", "--model", model]) == 0
     assert "Embedded 2 segments" in capsys.readouterr().out
+    assert vec.models_cached(model)
+    assert (config.MODELS_DIR / f"{model.replace('/', '--')}.ready").read_text().strip() == "8"
+
+
+def test_run_embed_rejects_unknown_model(conn, monkeypatch, capsys):
+    _patch_fastembed(monkeypatch)
+    assert vec.run_embed(model="evil/model") == 2
+    assert "Unknown model" in capsys.readouterr().err
+
+
+def test_run_embed_model_switch_requires_rebuild(conn, monkeypatch, capsys):
+    _patch_fastembed(monkeypatch)
+    a, b = sorted(vec.KNOWN_DIMS)
+    monkeypatch.setitem(vec.KNOWN_DIMS, a, 8)
+    monkeypatch.setitem(vec.KNOWN_DIMS, b, 8)
+    assert vec.run_embed(model=a) == 0
+    capsys.readouterr()
+    assert vec.run_embed(model=b) == 2
+    assert "--rebuild" in capsys.readouterr().err
+    assert vec.indexed_model() == a
+    # モデル未指定なら永続化されたモデルを使い続ける
+    assert vec.run_embed() == 0
+    assert vec.indexed_model() == a
+    assert vec.run_embed(model=b, rebuild=True) == 0
+    assert vec.indexed_model() == b
+
+
+def test_run_embed_rebuild_recovers_corrupt_index(conn, monkeypatch):
+    _patch_fastembed(monkeypatch)
+    config.VEC_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    config.VEC_DB_PATH.write_bytes(bytes(range(256)) * 40)
+    assert vec.run_embed() == 2
+    assert vec.run_embed(rebuild=True) == 0
+
+
+def test_run_embed_skips_when_locked(conn, monkeypatch, capsys):
+    _patch_fastembed(monkeypatch)
+    with vec.embed_lock():
+        assert vec.run_embed() == 1
+    assert "another embed is running" in capsys.readouterr().err
 
 
 def test_run_embed_no_db(db_env, monkeypatch):
-    _fake_fastembed(monkeypatch)
+    install_fake_fastembed(monkeypatch)
     assert vec.run_embed() == 1

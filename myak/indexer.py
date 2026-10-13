@@ -5,6 +5,7 @@ Stop hook から stdin 経由、または CLI 引数で呼ばれる。
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -335,9 +336,16 @@ def run_from_cli(argv=None):
     finally:
         conn.close()
     if args.embed:
-        from myak import vec
+        from myak import config, vec
 
-        n, reason = vec.try_embed_pending()  # フック経路ではダウンロードしない
+        # 分離された子プロセスなので CPU を譲る (onnxruntime のスレッド数も抑える)
+        os.environ.setdefault("OMP_NUM_THREADS", "2")
+        try:
+            os.nice(10)
+        except OSError:
+            pass
+        # フック経路ではダウンロードしない。1 回の上限を設け、残りは次回以降に回す
+        n, reason = vec.try_embed_pending(limit=config.HOOK_EMBED_LIMIT)
         print(f"Embedded {n} segments" if reason is None else f"Embedding skipped: {reason}")
 
 

@@ -15,6 +15,10 @@ STATE_DB_PATH = STATE_DIR / "state.db"
 # ベクトル索引 (派生キャッシュ。機械ローカル・同期対象外・再構築可能)
 VEC_DB_PATH = STATE_DIR / "memory.vec.db"
 MODELS_DIR = STATE_DIR / "models"
+# ベクトル検索の距離上限 (vec0 は distance_metric=cosine; 0=同一, 2=逆向き)。超える近傍は捨てる
+VEC_MAX_DISTANCE = 0.6
+# SessionEnd の自動埋め込み 1 回あたりの上限件数 (残りは次回以降 / `myak embed`)
+HOOK_EMBED_LIMIT = 500
 # fastembed 非対応の multilingual-e5-small の代わりに、対応済みの多言語 384 次元小型モデルを使う
 VEC_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
@@ -44,8 +48,11 @@ TOKEN_MATCH_GUARD = 3
 
 
 def vec_disabled():
-    """MYAK_DISABLE_VEC=1 でベクトル検索を無効化するキルスイッチ。"""
-    return os.environ.get("MYAK_DISABLE_VEC", "") not in ("", "0")
+    """MYAK_DISABLE_VEC でベクトル検索を無効化するキルスイッチ。
+
+    1 / true / yes / on (大文字小文字不問) のときだけ有効。それ以外 (空・0・false 等) は無効。
+    """
+    return os.environ.get("MYAK_DISABLE_VEC", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def home_parts():

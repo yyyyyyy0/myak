@@ -34,3 +34,25 @@ class FakeEmbedder:
                 v[3 + h % 5] += 0.3
         norm = math.sqrt(sum(x * x for x in v)) or 1.0
         return [x / norm for x in v]
+
+
+def install_fake_fastembed(monkeypatch, fail=False):
+    """sys.modules に偽 fastembed を差す (モデルはダウンロードしない)。ctor kwargs を返す。"""
+    import sys
+    import types
+
+    calls = {}
+
+    class TextEmbedding:
+        def __init__(self, **kwargs):
+            if fail:
+                raise RuntimeError("no model")
+            calls.update(kwargs)
+
+        def embed(self, texts):
+            return ([1, 2, 3] for _ in texts)
+
+    mod = types.ModuleType("fastembed")
+    mod.TextEmbedding = TextEmbedding
+    monkeypatch.setitem(sys.modules, "fastembed", mod)
+    return calls
