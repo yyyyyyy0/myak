@@ -7,6 +7,8 @@ description: Recall past Claude Code sessions and save durable facts with myak. 
 
 myak indexes past Claude Code sessions and exposes two MCP tools.
 
+When loaded as the `myak` plugin, the tools appear as `mcp__plugin_myak_myak__myak_search` and `mcp__plugin_myak_myak__myak_save`; from Claude Desktop they appear as `myak_search` / `myak_save`.
+
 ## myak_search
 
 Call it when you need earlier context: "what did we decide about X", "how did we fix Y last time", or before redoing work that may already exist.
