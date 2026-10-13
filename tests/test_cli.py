@@ -20,7 +20,7 @@ LAUNCHER = REPO / "templates" / "myak-hook.sh"
 
 SUBCOMMANDS = [
     "hook", "index", "query", "backfill", "export", "mcp",
-    "migrate", "reindex", "install-hooks",
+    "migrate", "reindex", "install-hooks", "migrate-settings",
 ]
 
 

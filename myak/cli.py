@@ -41,6 +41,16 @@ def build_parser():
 
     sub.add_parser("install-hooks", help="Install the hook launcher and print settings snippet")
 
+    ms = sub.add_parser(
+        "migrate-settings", help="Rewrite or remove myak hook entries in settings.json"
+    )
+    ms.add_argument("--mode", choices=["rewrite", "remove"], required=True)
+    ms.add_argument("--dry-run", action="store_true", help="Print a diff, change nothing")
+    ms.add_argument("--path", help="settings.json path (default: ~/.claude/settings.json)")
+    ms.add_argument(
+        "--launcher", help="Launcher path for rewrite (default: MEMORY_DIR/bin/myak-hook)"
+    )
+
     return parser
 
 
@@ -143,6 +153,25 @@ def cmd_install_hooks():
     return 0
 
 
+def cmd_migrate_settings(args):
+    from myak import settings_migrate
+
+    launcher = args.launcher or str(hook_launcher_path())
+    try:
+        result = settings_migrate.migrate_settings(
+            args.path, mode=args.mode, launcher=launcher, dry_run=args.dry_run
+        )
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    print(f"{result['path']}: {result['status']}")
+    if result["diff"]:
+        print(result["diff"], end="")
+    if result["backup"]:
+        print(f"Backup: {result['backup']}")
+    return 0
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] in PASSTHROUGH:
@@ -169,6 +198,8 @@ def main(argv=None):
         return cmd_reindex(args.full)
     if args.command == "install-hooks":
         return cmd_install_hooks()
+    if args.command == "migrate-settings":
+        return cmd_migrate_settings(args)
     parser.error(f"unknown command {args.command}")
     return 2
 
