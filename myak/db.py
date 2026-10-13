@@ -8,7 +8,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-CURRENT_VERSION = 1
+CURRENT_VERSION = 2
 KEEP_BACKUPS = 3
 
 _V0_TABLES = """
@@ -71,6 +71,13 @@ _V1_STEPS = (
 )
 
 
+_CWD_INDEX = (
+    "CREATE INDEX IF NOT EXISTS sessions_cwd_ended ON sessions(cwd, ended_at)"
+)
+
+_V2_STEPS = (_CWD_INDEX,)
+
+
 class SchemaTooNew(RuntimeError):
     """DB の user_version がこのコードより新しい。"""
 
@@ -122,7 +129,7 @@ def _statements(script):
 
 
 def create_schema(conn):
-    """新規 DB を v1 で直接作成する。既存 DB (v0/v1) には何もしない。
+    """新規 DB を現行版で直接作成する。既存 DB (v0/v1) には何もしない。
 
     DDL と user_version は 1 つの BEGIN IMMEDIATE ... COMMIT で原子的に実行する。
     """
@@ -139,6 +146,8 @@ def create_schema(conn):
         )
         + _FTS_AND_TRIGGERS
         + _UUID_INDEX
+        + ";\n"
+        + _CWD_INDEX
         + ";"
     )
     if conn.in_transaction:
@@ -197,7 +206,7 @@ def _prune_backups(dest_dir, db_name, keep=KEEP_BACKUPS):
 
 
 def migrate(conn, *, backup_dir=None):
-    """v0 → v1。明示的にのみ呼ぶ。結果 dict を返す。
+    """v0/v1 → 現行版。明示的にのみ呼ぶ。結果 dict を返す。
 
     バックアップは BEGIN IMMEDIATE の前に取る (バックアップ中も他プロセスの書き込みを
     止めないため)。バックアップ後〜ロック取得前の書き込みはバックアップに含まれないが、
@@ -245,7 +254,8 @@ def migrate(conn, *, backup_dir=None):
 
     conn.execute("BEGIN IMMEDIATE")
     try:
-        for sql in _V1_STEPS:
+        steps = (_V1_STEPS if version < 1 else ()) + _V2_STEPS
+        for sql in steps:
             _exec(conn, sql)
         conn.execute(f"PRAGMA user_version={CURRENT_VERSION}")
         conn.execute("COMMIT")

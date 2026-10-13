@@ -240,7 +240,7 @@ class TestRunHook:
         conn = sqlite3.connect(str(db_env.db_path))
         conn.executescript(
             """
-            PRAGMA user_version=1;
+            PRAGMA user_version=2;
             CREATE TABLE sessions (session_id TEXT PRIMARY KEY, project_path TEXT);
             CREATE TABLE segments (id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT, role TEXT, content TEXT, timestamp TEXT,
