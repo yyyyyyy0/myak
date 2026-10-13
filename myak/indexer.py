@@ -20,6 +20,7 @@ from myak.state import clear_cursor, fingerprint, get_cursor, set_cursor
 from myak.transcript import extract_segments as _extract_segments
 from myak.transcript import (
     extract_text_content,  # noqa: F401  (backward compat)
+    read_agent_meta,
 )
 
 
@@ -212,6 +213,33 @@ def _rollback(conn):
         conn.execute("ROLLBACK")
 
 
+def discover_transcripts(session_jsonl):
+    """[(path, agent_id, agent_type)]: 本体 ('' , None) の後にサブエージェントを列挙する。"""
+    session_jsonl = Path(session_jsonl)
+    found = [(session_jsonl, "", None)]
+    sub_dir = session_jsonl.with_suffix("") / "subagents"
+    if sub_dir.is_dir():
+        for agent_path in sorted(sub_dir.glob("agent-*.jsonl")):
+            agent_id = agent_path.stem[len("agent-"):]
+            meta = read_agent_meta(agent_path)
+            found.append((agent_path, agent_id, meta["agent_type"]))
+    return found
+
+
+def index_transcript_tree(conn, session_jsonl, project_slug=None, final=False):
+    """本体とサブエージェントの transcript をすべてインデックスする。挿入行数の合計を返す。"""
+    session_jsonl = Path(session_jsonl)
+    if project_slug is None:
+        project_slug = session_jsonl.parent.name
+    total = 0
+    for path, agent_id, agent_type in discover_transcripts(session_jsonl):
+        total += index_session(
+            conn, path, project_slug, final=final, agent_id=agent_id,
+            agent_type=agent_type, session_id=session_jsonl.stem,
+        )
+    return total
+
+
 def cwd_to_project_slug(cwd):
     """cwd をプロジェクトスラグに変換する。"""
     return cwd.replace("/", "-").lstrip("-")
@@ -245,7 +273,7 @@ def run_from_hook():
                 "(skipping index)", file=sys.stderr,
             )
             return
-        count = index_session(conn, jsonl_path, project_slug)
+        count = index_transcript_tree(conn, jsonl_path, project_slug)
         if count > 0:
             print(f"Indexed {count} segments from {jsonl_path.name}", file=sys.stderr)
     finally:
@@ -279,7 +307,7 @@ def run_from_cli():
         if not require_current(conn):
             print("Database schema is not current; run `myak migrate` first.", file=sys.stderr)
             sys.exit(1)
-        count = index_session(conn, jsonl_path, args.project, final=True)
+        count = index_transcript_tree(conn, jsonl_path, args.project, final=True)
         print(f"Indexed {count} segments from {jsonl_path.name}")
     finally:
         conn.close()
