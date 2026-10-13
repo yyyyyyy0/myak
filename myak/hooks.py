@@ -179,7 +179,7 @@ def handle_session_end(payload):
     conn.close()
     # -I: PYTHON* env/user site/cwd を無視。--file=: '-' 始まりのパスを option 扱いさせない
     cmd = [
-        sys.executable, "-I", "-m", "myak.cli", "index", f"--file={path}", "--final",
+        sys.executable, "-I", "-m", "myak.cli", "index", f"--file={path}", "--final", "--embed",
     ]
     slug = _project_slug(payload)
     if slug:

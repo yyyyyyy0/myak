@@ -301,6 +301,10 @@ def run_from_cli(argv=None):
         "--final", action="store_true",
         help="Accept an unterminated tail line (default behaviour of this command)",
     )
+    parser.add_argument(
+        "--embed", action="store_true",
+        help="After indexing, embed pending segments if myak[vec] and the model are present",
+    )
     args = parser.parse_args(argv)
 
     if args.file:
@@ -330,6 +334,11 @@ def run_from_cli(argv=None):
         print(f"Indexed {count} segments from {jsonl_path.name}")
     finally:
         conn.close()
+    if args.embed:
+        from myak import vec
+
+        n, reason = vec.try_embed_pending()  # フック経路ではダウンロードしない
+        print(f"Embedded {n} segments" if reason is None else f"Embedding skipped: {reason}")
 
 
 def main():
