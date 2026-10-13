@@ -14,55 +14,14 @@ from myak.config import (
     ensure_memory_dir,
     get_connection,
 )
+from myak.db import create_schema
 from myak.transcript import extract_segments as _extract_segments
 from myak.transcript import extract_text_content  # noqa: F401  (backward compat)
 
 
 def init_db(conn):
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            session_id TEXT PRIMARY KEY,
-            project_path TEXT,
-            started_at TEXT,
-            ended_at TEXT,
-            segment_count INTEGER DEFAULT 0,
-            indexed_at TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS segments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            timestamp TEXT,
-            FOREIGN KEY (session_id) REFERENCES sessions(session_id)
-        );
-
-        CREATE VIRTUAL TABLE IF NOT EXISTS segments_fts USING fts5(
-            content,
-            content='segments',
-            content_rowid='id',
-            tokenize='trigram'
-        );
-
-        CREATE TRIGGER IF NOT EXISTS segments_ai AFTER INSERT ON segments BEGIN
-            INSERT INTO segments_fts(rowid, content)
-            VALUES (new.id, new.content);
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS segments_ad AFTER DELETE ON segments BEGIN
-            INSERT INTO segments_fts(segments_fts, rowid, content)
-            VALUES ('delete', old.id, old.content);
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS segments_au AFTER UPDATE ON segments BEGIN
-            INSERT INTO segments_fts(segments_fts, rowid, content)
-            VALUES ('delete', old.id, old.content);
-            INSERT INTO segments_fts(rowid, content)
-            VALUES (new.id, new.content);
-        END;
-    """)
-    conn.commit()
+    """新規 DB は v1 で作成する。既存 DB は変更しない (migrate は明示的にのみ)。"""
+    create_schema(conn)
 
 
 def extract_segments(jsonl_path):

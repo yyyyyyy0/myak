@@ -9,6 +9,10 @@ MEMORY_DIR = Path(os.environ.get("MYAK_DIR", CLAUDE_DIR / "memory"))
 DB_PATH = MEMORY_DIR / "memory.db"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 
+# 機械ローカルの状態 (インクリメンタル索引のカーソル)。同期対象外。
+STATE_DIR = Path(os.environ.get("MYAK_STATE_DIR", CLAUDE_DIR / "myak-state"))
+STATE_DB_PATH = STATE_DIR / "state.db"
+
 # Obsidian vault は環境変数 or CLI 引数で指定
 OBSIDIAN_VAULT = os.environ.get("MYAK_OBSIDIAN_VAULT", "")
 
@@ -45,7 +49,12 @@ def ensure_memory_dir():
 
 
 def get_connection():
-    """同期セーフな SQLite 接続を返す。DELETE journal で WAL ファイル不要。"""
-    conn = sqlite3.connect(str(DB_PATH))
+    """同期セーフな SQLite 接続を返す。
+
+    DELETE journal で WAL ファイル不要。isolation_level=None (autocommit) なので
+    トランザクションは呼び出し側が明示的に BEGIN/COMMIT する。
+    """
+    conn = sqlite3.connect(str(DB_PATH), isolation_level=None)
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA journal_mode=DELETE")
     return conn
