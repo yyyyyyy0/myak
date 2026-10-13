@@ -53,3 +53,20 @@ def test_save_validates_and_refuses_v0(mem):
     make_v0(mem.db_path).close()
     r = mcp_server.save_memory("long enough memory text here")
     assert not r["saved"] and "migrate" in r["reason"]
+
+
+def test_duplicate_save_reports_and_does_not_bump_ended_at(mem):
+    text = "remember that the deploy key rotates monthly"
+    r1 = mcp_server.save_memory(text, session_id="desktop-d")
+    assert r1 == {"saved": True, "session_id": "desktop-d"}
+    c = sqlite3.connect(str(mem.db_path))
+    before = c.execute("SELECT ended_at, segment_count FROM sessions").fetchone()
+    c.close()
+    r2 = mcp_server.save_memory(text, role="user", session_id="desktop-d")
+    assert r2 == {"saved": True, "duplicate": True, "session_id": "desktop-d"}
+    c = sqlite3.connect(str(mem.db_path))
+    after = c.execute("SELECT ended_at, segment_count FROM sessions").fetchone()
+    roles = c.execute("SELECT role FROM segments").fetchall()
+    c.close()
+    assert after == before
+    assert roles == [("assistant",)]

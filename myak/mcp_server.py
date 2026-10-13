@@ -14,7 +14,11 @@ DESKTOP_SESSION_PREFIX = "desktop-"
 
 
 def save_memory(content, role="assistant", session_id=None):
-    """Save a memory segment to the database."""
+    """Save a memory segment to the database.
+
+    Deduplicated per session by content hash; `role` is not part of the dedupe key, so
+    saving the same text again with a different role is reported as a duplicate.
+    """
     if not isinstance(content, str):
         return {"saved": False, "reason": "Content must be a string"}
     if len(content.strip()) < 10:
@@ -45,24 +49,28 @@ def save_memory(content, role="assistant", session_id=None):
                 "VALUES (?, ?, ?, 0, ?) ON CONFLICT(session_id) DO NOTHING",
                 (session_id, "claude-desktop", timestamp, timestamp),
             )
-            conn.execute(
+            cur = conn.execute(
                 "INSERT INTO segments "
                 "(session_id, role, content, timestamp, uuid, agent_id) "
                 "VALUES (?, ?, ?, ?, ?, '') "
                 "ON CONFLICT(session_id, agent_id, uuid) WHERE uuid IS NOT NULL DO NOTHING",
                 (session_id, role, stored, timestamp, uuid),
             )
-            conn.execute(
-                "UPDATE sessions SET segment_count = "
-                "(SELECT COUNT(*) FROM segments WHERE session_id = ?), ended_at = ? "
-                "WHERE session_id = ?",
-                (session_id, timestamp, session_id),
-            )
+            duplicate = cur.rowcount == 0
+            if not duplicate:
+                conn.execute(
+                    "UPDATE sessions SET segment_count = "
+                    "(SELECT COUNT(*) FROM segments WHERE session_id = ?), ended_at = ? "
+                    "WHERE session_id = ?",
+                    (session_id, timestamp, session_id),
+                )
             conn.execute("COMMIT")
         except BaseException:
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
             raise
+        if duplicate:
+            return {"saved": True, "duplicate": True, "session_id": session_id}
         return {"saved": True, "session_id": session_id}
     except Exception as e:
         return {"saved": False, "reason": str(e)}
