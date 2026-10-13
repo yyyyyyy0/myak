@@ -1,23 +1,35 @@
 {
   "Stop": [
     {
-      "matcher": "*",
       "hooks": [
         {
           "type": "command",
-          "command": "myak-index",
-          "async": true
+          "command": "__MYAK_HOOK__ stop",
+          "async": true,
+          "timeout": 60,
+          "statusMessage": "myak: indexing"
+        }
+      ]
+    }
+  ],
+  "SessionEnd": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "__MYAK_HOOK__ session-end",
+          "timeout": 10
         }
       ]
     }
   ],
   "UserPromptSubmit": [
     {
-      "matcher": "*",
       "hooks": [
         {
           "type": "command",
-          "command": "myak-query --hook"
+          "command": "__MYAK_HOOK__ prompt",
+          "timeout": 10
         }
       ]
     }

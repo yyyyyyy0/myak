@@ -244,13 +244,13 @@ def format_codex(results, query):
     return "\n".join(lines)
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Search myak memory")
     parser.add_argument("query", nargs="*", help="Search query")
     parser.add_argument("--hook", action="store_true", help="Hook mode: JSON output")
     parser.add_argument("--codex", action="store_true", help="Codex mode: compact output")
     parser.add_argument("--limit", type=int, default=MAX_RESULTS, help="Max results")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     query = " ".join(args.query) if args.query else ""
 

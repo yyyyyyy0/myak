@@ -280,13 +280,17 @@ def run_from_hook():
         conn.close()
 
 
-def run_from_cli():
+def run_from_cli(argv=None):
     """CLI 引数でインデックスする。"""
     parser = argparse.ArgumentParser(description="Index a session transcript")
     parser.add_argument("--session", help="Session ID")
     parser.add_argument("--project", help="Project slug")
     parser.add_argument("--file", help="Direct path to JSONL file")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--final", action="store_true",
+        help="Accept an unterminated tail line (default behaviour of this command)",
+    )
+    args = parser.parse_args(argv)
 
     if args.file:
         jsonl_path = Path(args.file)

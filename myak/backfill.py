@@ -68,14 +68,14 @@ def backfill(project_filter=None, rebuild_fts=False):
         conn.close()
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Backfill all session transcripts")
     parser.add_argument("project", nargs="?", help="Filter by project slug (partial match)")
     parser.add_argument("--project", dest="project_opt", help="Same as the positional filter")
     parser.add_argument(
         "--rebuild-fts", action="store_true", help="Rebuild the FTS index after indexing"
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     project = args.project_opt or args.project
     sys.exit(backfill(project_filter=project, rebuild_fts=args.rebuild_fts))
