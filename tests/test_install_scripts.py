@@ -1,5 +1,6 @@
 """Shell-level tests for install.sh / uninstall.sh using stubbed uv/claude/myak."""
 import os
+import plistlib
 import subprocess
 from pathlib import Path
 
@@ -141,6 +142,62 @@ def test_uninstall_sequence(sandbox):
     assert _calls(log) == [
         "myak migrate-settings --mode remove",
         "claude plugin uninstall myak@myak",
+        "claude plugin marketplace remove myak",
         "uv tool uninstall myak",
     ]
     assert ".claude/memory" in r.stdout
+
+
+def _darwin_stubs(stubs, log):
+    _stub(stubs / "uname", "uname", log, extra='echo Darwin\n')
+    _stub(stubs / "launchctl", "launchctl", log)
+
+
+def test_install_launchagent_plist_roundtrips_awkward_vault(sandbox):
+    home, stubs, log = sandbox
+    _darwin_stubs(stubs, log)
+    vault = "/Users/x/My Vault & Notes <1>"
+    r = _run(INSTALL, home, stubs, {"MYAK_OBSIDIAN_VAULT": vault})
+    assert r.returncode == 0, r.stderr
+    plist = home / "Library" / "LaunchAgents" / "com.myak.export.plist"
+    data = plistlib.loads(plist.read_bytes())
+    assert data["Label"] == "com.myak.export"
+    assert data["ProgramArguments"][:3] == [
+        str(home / ".local" / "bin" / "myak-export"), "--vault", vault]
+    assert data["StartCalendarInterval"] == {"Hour": 9, "Minute": 17}
+    assert data["StandardOutPath"].startswith(str(home / "Library" / "Logs"))
+    calls = [c for c in _calls(log) if c.startswith("launchctl")]
+    assert calls[0].startswith("launchctl bootout gui/")
+    assert calls[1] == f"launchctl bootstrap gui/{os.getuid()} {plist}"
+    assert not any(" load " in c or " unload " in c for c in calls)
+
+
+def _plist(home, first_arg):
+    path = home / "Library" / "LaunchAgents" / "com.myak.export.plist"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(plistlib.dumps({"Label": "com.myak.export", "ProgramArguments": [first_arg]}))
+    return path
+
+
+def test_uninstall_removes_myak_launchagent_and_legacy_launcher(sandbox):
+    home, stubs, log = sandbox
+    _darwin_stubs(stubs, log)
+    plist = _plist(home, "/Users/x/.local/bin/myak-export")
+    legacy = home / ".claude" / "myak-state" / "bin" / "myak-hook"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("#!/bin/sh\n")
+    r = _run(UNINSTALL, home, stubs)
+    assert r.returncode == 0, r.stderr
+    assert not plist.exists() and not legacy.exists()
+    assert "Removed LaunchAgent" in r.stdout and "Removed legacy launcher" in r.stdout
+    assert any(c.startswith("launchctl bootout") for c in _calls(log))
+
+
+def test_uninstall_keeps_foreign_launchagent(sandbox):
+    home, stubs, log = sandbox
+    _darwin_stubs(stubs, log)
+    plist = _plist(home, "/usr/bin/something-else")
+    r = _run(UNINSTALL, home, stubs)
+    assert r.returncode == 0, r.stderr
+    assert plist.exists()
+    assert not any(c.startswith("launchctl") for c in _calls(log))

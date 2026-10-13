@@ -58,17 +58,26 @@ fi
 # 5. LaunchAgent (macOS only, optional)
 echo "[5/6] LaunchAgent setup..."
 if [ "$(uname)" = "Darwin" ] && [ -n "${MYAK_OBSIDIAN_VAULT:-}" ]; then
-    PLIST_TEMPLATE="$SCRIPT_DIR/myak/templates/com.myak.export.plist.template"
     PLIST_DEST="$LAUNCH_AGENTS/com.myak.export.plist"
+    LOG_DIR="$HOME/Library/Logs"
 
-    mkdir -p "$LAUNCH_AGENTS"
-    launchctl unload "$PLIST_DEST" 2>/dev/null || true
-
-    sed -e "s|__MYAK_EXPORT_BIN__|$EXPORT_SHIM|g" \
-        -e "s|__OBSIDIAN_VAULT__|$MYAK_OBSIDIAN_VAULT|g" \
-        "$PLIST_TEMPLATE" > "$PLIST_DEST"
-
-    launchctl load "$PLIST_DEST"
+    mkdir -p "$LAUNCH_AGENTS" "$LOG_DIR"
+    # plistlib escapes the vault path correctly (spaces, &, <, ...); sed did not.
+    EXPORT_SHIM="$EXPORT_SHIM" VAULT="$MYAK_OBSIDIAN_VAULT" PLIST_DEST="$PLIST_DEST" \
+        LOG_FILE="$LOG_DIR/myak-export.log" python3 -c '
+import os, plistlib
+data = {
+    "Label": "com.myak.export",
+    "ProgramArguments": [os.environ["EXPORT_SHIM"], "--vault", os.environ["VAULT"], "--since", "7"],
+    "StartCalendarInterval": {"Hour": 9, "Minute": 17},
+    "StandardOutPath": os.environ["LOG_FILE"],
+    "StandardErrorPath": os.environ["LOG_FILE"],
+}
+with open(os.environ["PLIST_DEST"], "wb") as f:
+    plistlib.dump(data, f)
+'
+    launchctl bootout "gui/$(id -u)" "$PLIST_DEST" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$PLIST_DEST"
     echo "  LaunchAgent installed: daily 9:17 AM export to $MYAK_OBSIDIAN_VAULT"
 else
     if [ "$(uname)" != "Darwin" ]; then
