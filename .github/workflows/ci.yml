@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  matrix:
     name: test (${{ matrix.os }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -50,3 +50,15 @@ jobs:
         run: |
           uv build --wheel
           unzip -l dist/*.whl | grep -q 'myak/templates/hooks.json'
+
+  # Aggregate gate: branch protection requires a check named exactly "test".
+  test:
+    name: test
+    needs: [matrix]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any matrix job did not succeed
+        run: |
+          echo "matrix result: ${{ needs.matrix.result }}"
+          test "${{ needs.matrix.result }}" = "success"
