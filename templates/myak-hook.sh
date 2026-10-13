@@ -1,5 +1,6 @@
 #!/bin/sh
 # myak hook launcher (POSIX sh). Resolves the interpreter without relying on PATH.
+# Never falls back to `uv tool run` (it could resolve an unrelated PyPI package).
 # Hooks must never fail the session: if nothing is found, exit 0 silently.
 event="$1"
 [ -n "$event" ] || exit 0
@@ -9,12 +10,6 @@ if [ -n "${MYAK_BIN:-}" ] && [ -x "$MYAK_BIN" ]; then
 fi
 if [ -x "$HOME/.local/bin/myak" ]; then
     exec "$HOME/.local/bin/myak" hook "$event"
-fi
-if [ -x "$HOME/.local/bin/uv" ]; then
-    exec "$HOME/.local/bin/uv" tool run myak hook "$event"
-fi
-if [ -x /opt/homebrew/bin/uv ]; then
-    exec /opt/homebrew/bin/uv tool run myak hook "$event"
 fi
 venv_file="${MYAK_STATE_DIR:-$HOME/.claude/myak-state}/venv-python"
 if [ -f "$venv_file" ]; then

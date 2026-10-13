@@ -288,13 +288,8 @@ def _fake_bin(path, marker):
 
 
 @pytest.fixture
-def isolated_launcher(tmp_path):
-    """/opt/homebrew の実 uv を踏まないよう、そのパスだけ無効化したコピー。"""
-    script = tmp_path / "launcher.sh"
-    script.write_text(
-        LAUNCHER.read_text().replace("/opt/homebrew/bin/uv", str(tmp_path / "no-such-uv"))
-    )
-    return script
+def isolated_launcher():
+    return LAUNCHER
 
 
 def test_launcher_uses_local_bin_myak(tmp_path):
@@ -318,13 +313,16 @@ def test_launcher_myak_bin_override_wins(tmp_path):
     assert not (tmp_path / "local").exists()
 
 
-def test_launcher_uv_fallback(tmp_path):
+def test_launcher_never_uses_uv(tmp_path):
     home = tmp_path / "home"
     marker = tmp_path / "uvcalled"
     _fake_bin(home / ".local" / "bin" / "uv", marker)
     r = _run_launcher(LAUNCHER, home, "stop", "{}")
     assert r.returncode == 0
-    assert marker.read_text().strip() == "tool run myak hook stop"
+    assert not marker.exists()
+    code = [ln for ln in LAUNCHER.read_text().splitlines() if not ln.lstrip().startswith("#")]
+    assert "tool run" not in "\n".join(code)
+    assert "/uv" not in "\n".join(code)
 
 
 def test_launcher_recorded_venv_python(tmp_path, isolated_launcher):
