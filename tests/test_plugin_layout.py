@@ -126,3 +126,44 @@ def test_run_sh_without_home_or_event_exits_zero(tmp_path):
     r = subprocess.run(["env", "-i", "sh", str(RUN_SH), "prompt"], capture_output=True, text=True)
     assert r.returncode == 0
     assert _run(tmp_path, []).returncode == 0
+
+
+def _ladder(path):
+    text = path.read_text()
+    return text.split("# --- resolve begin ---")[1].split("# --- resolve end ---")[0]
+
+
+def test_resolve_ladder_identical_in_both_launchers():
+    hook_sh = REPO / "myak" / "templates" / "myak-hook.sh"
+    assert _ladder(RUN_SH).strip() and _ladder(RUN_SH).encode() == _ladder(hook_sh).encode()
+
+
+def test_run_sh_hook_mode_exits_zero_when_binary_fails(tmp_path):
+    bad = tmp_path / ".local" / "bin" / "myak"
+    bad.parent.mkdir(parents=True)
+    bad.write_text("#!/bin/sh\nexit 7\n")
+    bad.chmod(0o755)
+    assert _run(tmp_path, ["prompt"]).returncode == 0
+    hook_sh = REPO / "myak" / "templates" / "myak-hook.sh"
+    r = subprocess.run(["env", "-i", f"HOME={tmp_path}", "sh", str(hook_sh), "stop"],
+                       capture_output=True, text=True, timeout=10)
+    assert r.returncode == 0
+
+
+def test_run_sh_mcp_without_interpreter_fails_loudly(tmp_path):
+    r = _run(tmp_path, ["mcp"])
+    assert r.returncode == 1
+    assert r.stderr.strip() == "myak: no interpreter found; run install.sh"
+    assert r.stdout == ""
+
+
+def test_run_sh_mcp_uses_venv_python(tmp_path):
+    marker = tmp_path / "argv"
+    py = tmp_path / "fakepy"
+    py.write_text(f'#!/bin/sh\necho "$@" > "{marker}"\n')
+    py.chmod(0o755)
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "venv-python").write_text(f"{py}\n")
+    assert _run(tmp_path, ["mcp"], {"MYAK_STATE_DIR": state}).returncode == 0
+    assert marker.read_text().strip() == "-I -m myak.cli mcp"
