@@ -271,6 +271,40 @@ def vector_candidates(conn, embedder, query, k=20):
     return [(r[0], r[1]) for r in rows]
 
 
+def forget_segments(conn, ids, chunk=500):
+    """削除/更新された segment のベクトルを消す (best effort)。消した件数を返す。
+
+    vec DB が無い/使えないなら何もしない。残っていても害はなく、更新行は
+    次回の `myak embed` で再計算される。
+    """
+    ids = list(ids)
+    if not ids or not config.VEC_DB_PATH.exists():
+        return 0
+    attached_here = False
+    try:
+        _load_extension(conn)
+        if not _attached(conn):
+            conn.execute("ATTACH DATABASE ? AS vec", (str(config.VEC_DB_PATH),))
+            attached_here = True
+        n = 0
+        for i in range(0, len(ids), chunk):
+            part = ids[i:i + chunk]
+            marks = ",".join("?" * len(part))
+            n += conn.execute(
+                f"DELETE FROM vec.segments_vec WHERE segment_id IN ({marks})", part
+            ).rowcount
+        return n
+    except (VecUnavailable, sqlite3.DatabaseError) as e:
+        logger.warning("could not drop stale vectors: %s", e)
+        return 0
+    finally:
+        if attached_here:
+            try:
+                conn.execute("DETACH DATABASE vec")
+            except sqlite3.DatabaseError:
+                pass
+
+
 @contextmanager
 def embed_lock():
     """STATE_DIR/embed.lock の非ブロッキング排他。取れなければ False を yield する。"""

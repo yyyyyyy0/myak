@@ -1,5 +1,6 @@
 """`myak clean-legacy`: Phase 1 のノイズ規則を uuid 無しの旧行へ遡って適用する。"""
 
+import sqlite3
 import sys
 
 from myak import db
@@ -52,9 +53,17 @@ def clean_legacy(conn, *, dry_run=False, backup_dir=None):
         raise ValueError(
             f"database schema is not current (v{db.schema_version(conn)}); run `myak migrate`"
         )
-    if conn.isolation_level is not None:
+    original_isolation = conn.isolation_level
+    if original_isolation is not None:
         conn.commit()
         conn.isolation_level = None
+    try:
+        return _clean(conn, dry_run, backup_dir)
+    finally:
+        conn.isolation_level = original_isolation
+
+
+def _clean(conn, dry_run, backup_dir):
     if dry_run:
         deletes, updates, examples, _ = _scan(conn)
         return {
@@ -62,7 +71,7 @@ def clean_legacy(conn, *, dry_run=False, backup_dir=None):
             "backup": None, "sessions_removed": 0, "dry_run": True,
         }
 
-    backup = db.make_backup(conn, f"v{db.CURRENT_VERSION}-clean", backup_dir)
+    backup = db.make_backup(conn, "clean", backup_dir)
     conn.execute("BEGIN IMMEDIATE")
     try:
         deletes, updates, examples, sessions = _scan(conn)
@@ -85,6 +94,10 @@ def clean_legacy(conn, *, dry_run=False, backup_dir=None):
         if conn.in_transaction:
             conn.execute("ROLLBACK")
         raise
+    # 削除/更新した行のベクトルは古い: 消しておけば次回 `myak embed` で再計算される (best effort)
+    from myak import vec
+
+    vec.forget_segments(conn, deletes + [seg_id for _, seg_id in updates])
     return {
         "deleted": len(deletes), "updated": len(updates), "examples": examples,
         "backup": str(backup) if backup else None, "sessions_removed": removed,
@@ -106,6 +119,9 @@ def run(dry_run=False):
         except ValueError as e:
             print(f"Error: {e}", file=sys.stderr)
             return 1
+        except sqlite3.OperationalError as e:
+            print(f"Error: database busy, retry ({e})", file=sys.stderr)
+            return 3
     finally:
         conn.close()
     verb = "would" if dry_run else "did"

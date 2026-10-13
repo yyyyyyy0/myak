@@ -160,3 +160,74 @@ def test_caveat_row_is_deleted_by_cleanup_and_dropped_live(db_env):
     rec = {"type": "user", "uuid": "u", "timestamp": "t",
            "message": {"role": "user", "content": CAVEAT + "z" * 200}}
     assert record_to_segment(rec) is None
+
+
+def test_migrate_backup_survives_repeated_clean_runs(db, tmp_path):
+    env, conn = db
+    bk = tmp_path / "bk"
+    migrate_bak = make_backup(conn, "v1", bk)
+    for _ in range(db_keep() + 2):
+        cleanup.clean_legacy(conn, backup_dir=bk)
+    assert migrate_bak.exists()
+    cleans = list(bk.glob("memory.db.bak-clean-*"))
+    assert len(cleans) == db_keep()
+    assert list(bk.glob("memory.db.bak-v1-*")) == [migrate_bak]
+
+
+def db_keep():
+    from myak.db import KEEP_BACKUPS
+
+    return KEEP_BACKUPS
+
+
+def test_isolation_level_restored(db, tmp_path):
+    env, conn = db
+    conn.isolation_level = ""
+    cleanup.clean_legacy(conn, backup_dir=tmp_path / "bk")
+    assert conn.isolation_level == ""
+    cleanup.clean_legacy(conn, dry_run=True)
+    assert conn.isolation_level == ""
+    conn.isolation_level = None
+
+
+def test_busy_database_exits_3(db, capsys, monkeypatch):
+    def busy(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(cleanup, "clean_legacy", busy)
+    assert cli.main(["clean-legacy"]) == 3
+    assert "database busy, retry" in capsys.readouterr().err
+
+
+def test_stale_vectors_dropped_for_deleted_and_updated_rows(db, tmp_path):
+    pytest.importorskip("sqlite_vec")
+    from myak import vec
+    from tests.fakes import FakeEmbedder
+
+    env, conn = db
+    vec.embed_pending(conn, FakeEmbedder())
+    all_ids = {r[0] for r in conn.execute("SELECT id FROM segments")}
+    r = cleanup.clean_legacy(conn, backup_dir=tmp_path / "bk")
+    assert (r["deleted"], r["updated"]) == (5, 1)
+    left = {r[0] for r in conn.execute("SELECT segment_id FROM vec.segments_vec")}
+    live = {r[0] for r in conn.execute("SELECT id FROM segments")}
+    assert not (left - live)  # 消えた行のベクトルは残らない
+    assert len(left) == len(all_ids) - 5 - 1  # 更新行も消して再埋め込み対象にする
+    assert vec.embed_pending(conn, FakeEmbedder()) == 1
+
+
+def test_forget_segments_noop_without_vec_db(db):
+    from myak import vec
+
+    env, conn = db
+    assert vec.forget_segments(conn, [1, 2]) == 0
+    assert vec.forget_segments(conn, []) == 0
+
+
+def test_forget_segments_survives_garbage_vec_db(db):
+    from myak import vec
+
+    env, conn = db
+    config.VEC_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    config.VEC_DB_PATH.write_bytes(bytes(range(256)) * 40)
+    assert vec.forget_segments(conn, [1]) == 0

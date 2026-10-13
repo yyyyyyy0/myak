@@ -193,10 +193,15 @@ def _counts(conn):
     }
 
 
-def _prune_backups(dest_dir, db_name, keep=KEEP_BACKUPS):
-    """古いバックアップを削除し、新しい順に keep 個だけ残す。"""
+def _backup_prefix(tag):
+    """migrate (`bak-v*`) と clean-legacy (`bak-clean-*`) は別々に刈り込む。"""
+    return "bak-clean-" if tag == "clean" else "bak-v"
+
+
+def _prune_backups(dest_dir, db_name, keep=KEEP_BACKUPS, prefix="bak-v"):
+    """古いバックアップを削除し、新しい順に keep 個だけ残す (prefix ごと)。"""
     files = sorted(
-        dest_dir.glob(f"{db_name}.bak-v*"), key=lambda p: (p.stat().st_mtime_ns, p.name)
+        dest_dir.glob(f"{db_name}.{prefix}*"), key=lambda p: (p.stat().st_mtime_ns, p.name)
     )
     for old in files[:-keep]:
         try:
@@ -225,7 +230,7 @@ def make_backup(conn, tag, backup_dir=None):
         conn.backup(dest)
     finally:
         dest.close()
-    _prune_backups(dest_dir, db_file.name)
+    _prune_backups(dest_dir, db_file.name, prefix=_backup_prefix(tag))
     return backup_path
 
 
