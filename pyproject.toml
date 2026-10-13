@@ -13,6 +13,7 @@ license = "MIT"
 include = ["myak*"]
 
 [project.scripts]
+myak = "myak.cli:main"
 myak-index = "myak.indexer:main"
 myak-query = "myak.query:main"
 myak-backfill = "myak.backfill:main"

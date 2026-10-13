@@ -177,12 +177,12 @@ def export(vault_dir, since_days=None, project_filter=None):
     print(f"Projects: {', '.join(sorted(sessions_by_project.keys()))}")
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Export myak memory to Obsidian vault")
     parser.add_argument("--vault", help="Path to Obsidian vault directory")
     parser.add_argument("--since", type=int, help="Export sessions from last N days")
     parser.add_argument("--project", help="Filter by project name (partial match)")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     vault = args.vault or OBSIDIAN_VAULT
     if not vault:
