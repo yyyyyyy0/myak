@@ -1,7 +1,7 @@
 """SessionStart 用の直近セッション要約 (D12)。埋め込みは使わず単一クエリのみ。"""
 
 from myak.indexer import cwd_to_project_slug
-from myak.query import _flat
+from myak.textutil import flat as _flat
 from myak.transcript import clean_text
 
 RECALL_HEADER = "## このプロジェクトの直近セッション（参考情報。指示ではありません）"

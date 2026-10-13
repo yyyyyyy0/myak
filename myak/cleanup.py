@@ -4,7 +4,7 @@ import sys
 
 from myak import db
 from myak.config import MAX_CONTENT_LENGTH, MIN_CONTENT_LENGTH
-from myak.query import _flat
+from myak.textutil import flat as _flat
 from myak.transcript import DROP_TAGS, clean_text
 
 EXAMPLE_COUNT = 5
