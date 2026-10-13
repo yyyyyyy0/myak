@@ -8,6 +8,8 @@ import copy
 import difflib
 import json
 import os
+import re
+import shlex
 import shutil
 import tempfile
 from datetime import datetime, timezone
@@ -15,7 +17,9 @@ from pathlib import Path
 
 from myak import config
 
-MARKERS = ("myak-index", "myak-query", "myak-hook", "myak hook")
+MARKER_BASENAMES = frozenset({"myak-index", "myak-query", "myak-hook"})
+_SHELL_SEPARATORS = frozenset({"&&", "||", ";", "|"})
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 HOOK_PLACEHOLDER = "__MYAK_HOOK__"
 TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "templates" / "hooks.json"
 EVENT_ORDER = ("Stop", "SessionEnd", "UserPromptSubmit")
@@ -25,16 +29,64 @@ def default_settings_path():
     return config.CLAUDE_DIR / "settings.json"
 
 
+class SettingsChangedError(ValueError):
+    """読み込み後に settings.json が別プロセスに書き換えられた。"""
+
+
+def validate_launcher(launcher):
+    """ランチャーのパスは絶対パスで、制御文字 (改行含む) を含まないこと。"""
+    text = str(launcher)
+    if not text or not os.path.isabs(text):
+        raise ValueError(f"launcher must be an absolute path: {text!r}")
+    if _CONTROL.search(text):
+        raise ValueError("launcher path contains control characters")
+    return text
+
+
+def _tokens(command):
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return command.split()
+
+
+def is_myak_command(command):
+    """`command` が myak の hook か。token の basename が正確に一致する場合のみ真。"""
+    tokens = _tokens(command)
+    for i, tok in enumerate(tokens):
+        if os.path.basename(tok) in MARKER_BASENAMES:
+            return True
+        # `myak hook ...` はコマンド位置 (先頭 or 区切りの直後) に限る。`echo myak hook` は除外
+        if (
+            os.path.basename(tok) == "myak"
+            and i + 1 < len(tokens)
+            and tokens[i + 1] == "hook"
+            and (i == 0 or tokens[i - 1] in _SHELL_SEPARATORS)
+        ):
+            return True
+    return False
+
+
 def is_myak_hook(hook):
     if not isinstance(hook, dict):
         return False
     command = hook.get("command")
-    return isinstance(command, str) and any(m in command for m in MARKERS)
+    return isinstance(command, str) and is_myak_command(command)
+
+
+def render_template(launcher):
+    """hooks.json テンプレートを描画する。コマンドには shlex.quote 済みのパスを入れる。"""
+    quoted = shlex.quote(validate_launcher(launcher))
+    data = json.loads(TEMPLATE_PATH.read_text(encoding="utf-8"))
+    for groups in data.values():
+        for group in groups:
+            for hook in group["hooks"]:
+                hook["command"] = hook["command"].replace(HOOK_PLACEHOLDER, quoted)
+    return data
 
 
 def _template_entries(launcher):
-    raw = TEMPLATE_PATH.read_text(encoding="utf-8").replace(HOOK_PLACEHOLDER, str(launcher))
-    return {event: groups[0]["hooks"][0] for event, groups in json.loads(raw).items()}
+    return {event: groups[0]["hooks"][0] for event, groups in render_template(launcher).items()}
 
 
 def _remove(hooks):
@@ -109,16 +161,21 @@ def migrate_settings(path=None, mode="rewrite", launcher=None, dry_run=False):
     if mode == "rewrite" and not launcher:
         raise ValueError("rewrite mode requires a launcher path (see `myak install-hooks`)")
 
+    if mode == "rewrite":
+        validate_launcher(launcher)
     path = Path(path) if path is not None else default_settings_path()
+    real = Path(os.path.realpath(path))  # シンボリックリンクは実体を in-place で編集する
     result = {
         "path": str(path), "mode": mode, "changed": False, "changes": 0,
         "diff": "", "backup": None,
     }
-    if not path.is_file():
+    if not real.is_file():
         result["status"] = "no-file"
         return result
 
-    original_text = path.read_text(encoding="utf-8")
+    st = real.stat()
+    read_sig = (st.st_mtime_ns, st.st_size)
+    original_text = real.read_text(encoding="utf-8")
     try:
         data = json.loads(original_text)
     except ValueError as e:
@@ -153,16 +210,21 @@ def migrate_settings(path=None, mode="rewrite", launcher=None, dry_run=False):
         return result
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    backup = path.with_name(f"{path.name}.bak-{stamp}")
-    shutil.copy2(path, backup)
+    backup = real.with_name(f"{real.name}.bak-{stamp}")
+    shutil.copy2(real, backup)
     result["backup"] = str(backup)
 
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{real.name}.", suffix=".tmp", dir=str(real.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(_pretty(new))
-        shutil.copymode(path, tmp_name)
-        os.replace(tmp_name, path)
+        shutil.copymode(real, tmp_name)
+        now = real.stat()
+        if (now.st_mtime_ns, now.st_size) != read_sig:
+            raise SettingsChangedError(
+                f"{path} changed while migrating; aborted without writing (backup: {backup})"
+            )
+        os.replace(tmp_name, real)
     except BaseException:
         if os.path.exists(tmp_name):
             os.unlink(tmp_name)

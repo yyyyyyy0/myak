@@ -8,7 +8,6 @@ from pathlib import Path
 from myak import config
 
 TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
-HOOK_PLACEHOLDER = "__MYAK_HOOK__"
 
 # 既存モジュールの main(argv) にそのまま委譲するサブコマンド
 PASSTHROUGH = {
@@ -141,7 +140,9 @@ def cmd_install_hooks():
     venv_file = config.STATE_DIR / "venv-python"
     config.atomic_write(venv_file, sys.executable + "\n", 0o600)
 
-    hooks = json.loads(hooks_src.read_text(encoding="utf-8").replace(HOOK_PLACEHOLDER, str(dest)))
+    from myak import settings_migrate
+
+    hooks = settings_migrate.render_template(dest)
     print(f"Launcher: {dest}")
     print(f"Recorded interpreter: {sys.executable} -> {venv_file}")
     print("Add this to ~/.claude/settings.json (or run `myak migrate-settings`):")

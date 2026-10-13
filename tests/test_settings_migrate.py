@@ -286,3 +286,95 @@ def test_cli_error_on_bad_json(tmp_path, capsys):
     p.write_text("{")
     assert cli.main(["migrate-settings", "--mode", "remove", "--path", str(p)]) == 1
     assert "not valid JSON" in capsys.readouterr().err
+
+
+# ---- hardening --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    "myak-query-wrapper --x", "echo myak hook", "echo myak-hookish", "/opt/myak-index2 run",
+    "myak hooks", "notmyak hook stop",
+])
+def test_markers_do_not_overmatch(cmd):
+    assert not is_myak_hook({"command": cmd})
+
+
+@pytest.mark.parametrize("cmd", [
+    BROKEN_QUERY, "'/a b/myak-hook' stop", "~/.local/bin/myak hook stop",
+    "true && myak hook stop", "/x/myak-index --final", 'unbalanced "quote myak-hook',
+])
+def test_markers_match_real_entries(cmd):
+    assert is_myak_hook({"command": cmd})
+
+
+def test_launcher_with_space_roundtrips_quoted(tmp_path):
+    import shlex
+
+    p = tmp_path / "s.json"
+    p.write_text("{}")
+    launcher = "/Users/a b/it's/myak-hook"
+    migrate_settings(p, mode="rewrite", launcher=launcher)
+    cmds = myak_commands(load(p))
+    assert len(cmds) == 3
+    for cmd, event in zip(sorted(cmds), sorted(["stop", "session-end", "prompt"])):
+        assert shlex.split(cmd)[0] == launcher
+    assert {shlex.split(c)[1] for c in cmds} == {"stop", "session-end", "prompt"}
+    # 再実行しても重複しない (引用付きコマンドも myak のものと認識)
+    assert not migrate_settings(p, mode="rewrite", launcher=launcher)["changed"]
+    assert migrate_settings(p, mode="remove")["changes"] == 3
+
+
+@pytest.mark.parametrize("bad", ["relative/myak-hook", "", "/a/b\nc", "/a/\x07b", "/a/\x7f"])
+def test_rejects_bad_launcher(tmp_path, bad):
+    p = tmp_path / "s.json"
+    p.write_text("{}")
+    with pytest.raises(ValueError):
+        migrate_settings(p, mode="rewrite", launcher=bad)
+    assert p.read_text() == "{}"
+
+
+def test_symlinked_settings_edited_in_place(tmp_path):
+    real_dir = tmp_path / "dotfiles"
+    real_dir.mkdir()
+    real = real_dir / "settings.json"
+    real.write_text(json.dumps(owner_settings()))
+    link = tmp_path / "settings.json"
+    link.symlink_to(real)
+    r = migrate_settings(link, mode="remove")
+    assert r["changed"]
+    assert link.is_symlink() and link.resolve() == real.resolve()
+    assert myak_commands(load(real)) == []
+    assert list(real_dir.glob("settings.json.bak-*")) and not list(tmp_path.glob("*.bak-*"))
+    assert not list(tmp_path.glob(".settings.json.*"))
+
+
+def test_concurrent_modification_aborts(settings, monkeypatch):
+    real_copy = settings_migrate.shutil.copy2
+
+    def copy_then_modify(src, dst, **kw):
+        out = real_copy(src, dst, **kw)
+        with open(src, "a") as f:
+            f.write("\n")  # 別プロセスの書き込みを模擬
+        return out
+
+    monkeypatch.setattr(settings_migrate.shutil, "copy2", copy_then_modify)
+    before = settings.read_text()
+    with pytest.raises(settings_migrate.SettingsChangedError, match="changed while migrating"):
+        migrate_settings(settings, mode="remove")
+    assert settings.read_text() == before + "\n"
+    assert not list(settings.parent.glob(".settings.json.*.tmp"))
+
+
+def test_cli_prints_quoted_snippet(db_env, tmp_path, monkeypatch, capsys):
+    import shlex
+
+    monkeypatch.setattr(config, "STATE_DIR", tmp_path / "st ate")
+    assert cli.main(["install-hooks"]) == 0
+    out = capsys.readouterr().out
+    cmd = json.loads(out[out.index("{"):])["hooks"]["Stop"][0]["hooks"][0]["command"]
+    assert shlex.split(cmd) == [str(tmp_path / "st ate" / "bin" / "myak-hook"), "stop"]
+
+
+def test_cli_rejects_relative_launcher(settings, capsys):
+    rc = cli.main(["migrate-settings", "--mode", "rewrite", "--launcher", "rel/x",
+                   "--path", str(settings)])
+    assert rc == 1 and "absolute" in capsys.readouterr().err
