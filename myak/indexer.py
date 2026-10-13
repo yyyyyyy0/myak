@@ -10,12 +10,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from myak.config import (
-    MAX_CONTENT_LENGTH,
-    MIN_CONTENT_LENGTH,
     PROJECTS_DIR,
     ensure_memory_dir,
     get_connection,
 )
+from myak.transcript import extract_segments as _extract_segments
+from myak.transcript import extract_text_content  # noqa: F401  (backward compat)
 
 
 def init_db(conn):
@@ -65,52 +65,9 @@ def init_db(conn):
     conn.commit()
 
 
-def extract_text_content(content):
-    """message.content からテキストを抽出する。str or list[block] に対応。"""
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        texts = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                text = block.get("text", "").strip()
-                if text:
-                    texts.append(text)
-        return "\n".join(texts)
-    return ""
-
-
 def extract_segments(jsonl_path):
-    """JSONL ファイルからセグメントを抽出する。"""
-    segments = []
-    with open(jsonl_path, encoding="utf-8") as f:
-        for line in f:
-            try:
-                rec = json.loads(line)
-            except (json.JSONDecodeError, ValueError):
-                continue
-
-            rec_type = rec.get("type", "")
-            if rec_type not in ("user", "assistant"):
-                continue
-
-            msg = rec.get("message")
-            if not msg:
-                continue
-
-            role = msg.get("role", rec_type)
-            content = extract_text_content(msg.get("content", ""))
-
-            if len(content) < MIN_CONTENT_LENGTH:
-                continue
-
-            segments.append({
-                "role": role,
-                "content": content[:MAX_CONTENT_LENGTH],
-                "timestamp": rec.get("timestamp", ""),
-            })
-
-    return segments
+    """JSONL ファイルからセグメントを抽出する（transcript に委譲）。"""
+    return _extract_segments(jsonl_path)[0]
 
 
 def find_jsonl_for_session(session_id, project_slug=None):
