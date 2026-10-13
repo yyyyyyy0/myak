@@ -13,6 +13,7 @@ import shlex
 import shutil
 import tempfile
 from datetime import datetime, timezone
+from importlib.resources import files
 from pathlib import Path
 
 from myak import config
@@ -21,7 +22,7 @@ MARKER_BASENAMES = frozenset({"myak-index", "myak-query", "myak-hook"})
 _SHELL_SEPARATORS = frozenset({"&&", "||", ";", "|"})
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 HOOK_PLACEHOLDER = "__MYAK_HOOK__"
-TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "templates" / "hooks.json"
+TEMPLATE_PATH = Path(str(files("myak") / "templates")) / "hooks.json"
 EVENT_ORDER = ("Stop", "SessionEnd", "UserPromptSubmit")
 
 

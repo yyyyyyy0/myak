@@ -4,13 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "myak"
-version = "0.1.0"
+version = "0.3.0"
 description = "Persistent memory for Claude Code — auto-index sessions, FTS5 search, Obsidian export"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 license = "MIT"
+dependencies = ["mcp>=2.3,<3"]
 
 [tool.setuptools.packages.find]
 include = ["myak*"]
+
+[tool.setuptools.package-data]
+myak = ["templates/*"]
 
 [project.scripts]
 myak = "myak.cli:main"
@@ -20,7 +24,7 @@ myak-backfill = "myak.backfill:main"
 myak-export = "myak.export_obsidian:main"
 myak-mcp = "myak.mcp_server:main"
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
     "pytest>=9.0",
     "pytest-cov>=7.0",
@@ -42,6 +46,7 @@ skip_covered = false
 
 [tool.ruff]
 line-length = 100
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]

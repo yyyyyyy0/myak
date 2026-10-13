@@ -3,11 +3,12 @@
 import argparse
 import json
 import sys
+from importlib.resources import files
 from pathlib import Path
 
 from myak import config
 
-TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
+TEMPLATES_DIR = Path(str(files("myak") / "templates"))
 
 # 既存モジュールの main(argv) にそのまま委譲するサブコマンド
 PASSTHROUGH = {
