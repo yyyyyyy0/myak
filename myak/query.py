@@ -18,6 +18,7 @@ from myak.config import (
     MIN_ABSOLUTE_SCORE,
     MIN_MATCHING_TOKENS,
     MIN_RELATIVE_SCORE,
+    SUBAGENT_WEIGHT,
     TOKEN_MATCH_GUARD,
     get_connection,
 )
@@ -117,7 +118,7 @@ def search(query, max_results=MAX_RESULTS):
         rows = conn.execute(
             """
             SELECT s.role, s.content, s.timestamp, s.session_id, se.project_path,
-                   rank
+                   rank, s.agent_type
             FROM segments_fts f
             JOIN segments s ON s.id = f.rowid
             JOIN sessions se ON se.session_id = s.session_id
@@ -127,15 +128,17 @@ def search(query, max_results=MAX_RESULTS):
             """,
             (fts_query, max_results * 3),
         ).fetchall()
-    except Exception:
+    except Exception:  # sqlite3.OperationalError（v0 DB・FTS 構文エラー）含む
         return []
     finally:
         conn.close()
 
     results = []
     for row in rows:
-        role, content, timestamp, session_id, project, fts_rank = row
+        role, content, timestamp, session_id, project, fts_rank, agent_type = row
         score = time_decay_score(timestamp, abs(fts_rank))
+        if agent_type is not None:
+            score *= SUBAGENT_WEIGHT
         results.append({
             "role": role,
             "content": content[:MAX_SNIPPET_CHARS],
@@ -143,6 +146,7 @@ def search(query, max_results=MAX_RESULTS):
             "session_id": session_id[:8],
             "project": project or "",
             "score": score,
+            "agent_type": agent_type,
         })
 
     results.sort(key=lambda r: r["score"], reverse=True)
