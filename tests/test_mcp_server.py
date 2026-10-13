@@ -76,3 +76,36 @@ def test_protocol_round_trip(mem):
     assert not found.is_error and "platypus" in found.content[0].text
     assert short.is_error and "Query too short" in short.content[0].text
     assert bad.is_error and "Failed to save" in bad.content[0].text
+
+
+def test_search_query_is_stripped_before_length_check():
+    with pytest.raises(ToolError, match="Query too short"):
+        myak_search("  a  ")
+
+
+def test_search_failure_is_sanitized(mem, monkeypatch, caplog):
+    def boom(q, max_results):
+        raise RuntimeError("/secret/path/memory.db is locked")
+
+    monkeypatch.setattr(mcp_server, "search", boom)
+    with pytest.raises(ToolError) as ei:
+        myak_search("platypus")
+    assert str(ei.value) == "Search failed: RuntimeError"
+    assert "secret" not in str(ei.value)
+    assert "myak_search failed" in caplog.text
+
+
+def test_save_rejects_overlong_content(mem):
+    with pytest.raises(ToolError, match="Content too long"):
+        myak_save("x" * 4001, session_id="desktop-t")
+    assert "Saved to memory" in myak_save("y" * 4000, session_id="desktop-t")
+
+
+@pytest.mark.parametrize("sid", ["a" * 65, "has space", "bad/slash", "", "新"])
+def test_save_rejects_invalid_session_id(mem, sid):
+    with pytest.raises(ToolError, match="Invalid session_id"):
+        myak_save("remember the unique platypus checklist", session_id=sid)
+
+
+def test_save_memory_still_truncates_as_safety_net(mem):
+    assert mcp_server.save_memory("z" * 5000, session_id="desktop-s")["saved"]

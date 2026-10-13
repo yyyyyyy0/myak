@@ -2,6 +2,7 @@
 
 import hashlib
 import logging
+import re
 import sys
 from datetime import datetime, timezone
 from typing import Literal
@@ -16,6 +17,8 @@ from myak.indexer import init_db
 from myak.query import format_plain, search
 
 DESKTOP_SESSION_PREFIX = "desktop-"
+MAX_CONTENT_CHARS = 4000
+SESSION_ID_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 
 logger = logging.getLogger("myak.mcp")
 
@@ -48,7 +51,7 @@ def save_memory(content, role="assistant", session_id=None):
             }
 
         timestamp = now.isoformat()
-        stored = content[:4000]
+        stored = content[:MAX_CONTENT_CHARS]  # safety net; the tool rejects longer input
         uuid = "save:" + hashlib.sha1(content.encode("utf-8")).hexdigest()[:16]
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -97,10 +100,16 @@ def save_memory(content, role="assistant", session_id=None):
 )
 def myak_search(query: str, limit: int = 5) -> str:
     """query: search query (min 3 chars, Japanese or English). limit: 1-20, default 5."""
+    query = query.strip()
     if len(query) < 3:
         raise ToolError("Query too short (min 3 chars)")
     limit = max(1, min(limit, 20))
-    return format_plain(search(query, max_results=limit), query)
+    try:
+        results = search(query, max_results=limit)
+    except Exception as e:
+        logger.exception("myak_search failed")
+        raise ToolError(f"Search failed: {type(e).__name__}") from None
+    return format_plain(results, query)
 
 
 @mcp.tool(
@@ -118,6 +127,10 @@ def myak_save(
     session_id: str | None = None,
 ) -> str:
     """content: info to save (10-4000 chars). role: who produced it. session_id: optional."""
+    if isinstance(content, str) and len(content) > MAX_CONTENT_CHARS:
+        raise ToolError(f"Content too long ({len(content)} chars; max {MAX_CONTENT_CHARS})")
+    if session_id is not None and not SESSION_ID_RE.fullmatch(session_id):
+        raise ToolError("Invalid session_id (max 64 chars of A-Z a-z 0-9 _ . : -)")
     result = save_memory(content, role=role, session_id=session_id)
     if result["saved"] and result.get("duplicate"):
         return f"Already saved (duplicate, session: {result['session_id']})"
