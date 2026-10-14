@@ -169,10 +169,13 @@ Hook recall filters aggressively:
 
 Adds vector search on top of FTS5, fused with RRF.
 
+myak is not on PyPI, so install the extra from the clone (or from git):
+
 ```bash
-uv tool install 'myak[vec]' --python 3.12
-# or, for an existing install:
-uv tool install myak --with 'myak[vec]' --force
+# from your clone (replaces an existing install)
+uv tool install '.[vec]' --python 3.12 --force
+# or straight from GitHub, pinned to a release
+uv tool install 'myak[vec] @ git+https://github.com/yyyyyyy0/myak.git@v0.3.0' --python 3.12 --force
 myak embed
 ```
 
