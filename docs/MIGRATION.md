@@ -1,5 +1,7 @@
 # Migrating from 0.1 / 0.2 to 0.3
 
+English | [日本語](MIGRATION.ja.md)
+
 0.3 changes the schema, the install method and the hook wiring. Nothing is migrated automatically.
 
 ## Before you start

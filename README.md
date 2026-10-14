@@ -1,5 +1,7 @@
 # myak
 
+English | [日本語](README.ja.md)
+
 > **myak** — from Japanese **脈** (myaku), meaning "pulse" or "vein". As in 文脈 (context) and 脈絡 (coherence) — the threads of meaning that connect conversations over time.
 
 Persistent memory for Claude Code. Indexes session transcripts into SQLite FTS5 and makes past conversations searchable across projects and sessions.
