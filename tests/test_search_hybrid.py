@@ -5,10 +5,11 @@ import sys
 import pytest
 
 from myak import query, search, vec
+from tests._vec_skip import require_sqlite_vec
 from tests.fakes import FakeEmbedder
 from tests.test_vec import make_db
 
-pytest.importorskip("sqlite_vec")
+require_sqlite_vec()
 
 
 @pytest.fixture

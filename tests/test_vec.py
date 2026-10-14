@@ -6,9 +6,10 @@ from datetime import datetime, timezone
 import pytest
 
 from myak import config, db, vec
+from tests._vec_skip import require_sqlite_vec
 from tests.fakes import FakeEmbedder, install_fake_fastembed
 
-pytest.importorskip("sqlite_vec")
+require_sqlite_vec()
 
 SCHEMA = f"""
 PRAGMA user_version={db.CURRENT_VERSION};
