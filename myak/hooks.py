@@ -179,7 +179,7 @@ def handle_session_end(payload):
     conn.close()
     # -I: PYTHON* env/user site/cwd を無視。--file=: '-' 始まりのパスを option 扱いさせない
     cmd = [
-        sys.executable, "-I", "-m", "myak.cli", "index", f"--file={path}", "--final",
+        sys.executable, "-I", "-m", "myak.cli", "index", f"--file={path}", "--final", "--embed",
     ]
     slug = _project_slug(payload)
     if slug:
@@ -212,8 +212,29 @@ def handle_prompt(payload):
 
 
 def handle_session_start(payload):
-    """Phase 3 で実装。現状は何も出力しない。"""
-    return ""
+    """直近セッションを additionalContext として返す。DDL・埋め込みは行わない。"""
+    from myak import recall
+
+    if payload.get("source") not in recall.START_SOURCES:
+        return ""
+    cwd = payload.get("cwd")
+    if not isinstance(cwd, str) or not cwd or not config.DB_PATH.exists():
+        return ""
+    conn = get_connection()
+    try:
+        if not require_current(conn):
+            _log_schema_once()
+            return ""
+        rows = recall.recent_sessions(conn, cwd, exclude_session=payload.get("session_id"))
+        text = recall.format_session_start(rows)
+    finally:
+        conn.close()
+    if not text:
+        return ""
+    return json.dumps(
+        {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}},
+        ensure_ascii=False,
+    )
 
 
 def dispatch(event, stdin_text):

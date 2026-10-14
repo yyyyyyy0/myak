@@ -14,7 +14,7 @@ from myak import __version__
 from myak.config import ensure_memory_dir, get_connection
 from myak.db import require_current
 from myak.indexer import init_db
-from myak.query import format_plain, search
+from myak.query import filter_hybrid, format_plain, search
 
 DESKTOP_SESSION_PREFIX = "desktop-"
 MAX_CONTENT_CHARS = 4000
@@ -105,11 +105,15 @@ def myak_search(query: str, limit: int = 5) -> str:
         raise ToolError("Query too short (min 3 chars)")
     limit = max(1, min(limit, 20))
     try:
-        results = search(query, max_results=limit)
+        try:
+            results = search(query, max_results=limit, use_vec=True)
+        except Exception:
+            logger.warning("hybrid search failed; falling back to FTS", exc_info=True)
+            results = search(query, max_results=limit, use_vec=False)
     except Exception as e:
         logger.exception("myak_search failed")
         raise ToolError(f"Search failed: {type(e).__name__}") from None
-    return format_plain(results, query)
+    return format_plain(filter_hybrid(results, query), query)
 
 
 @mcp.tool(

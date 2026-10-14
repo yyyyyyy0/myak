@@ -121,11 +121,6 @@ def test_unknown_event(env, capsys):
     assert capsys.readouterr().out == ""
 
 
-def test_session_start_stub(env, capsys):
-    assert hooks.dispatch("session-start", payload(env, source="startup")) == 0
-    assert capsys.readouterr().out == ""
-
-
 def test_v0_schema_logs_once_and_does_not_index(env, capsys):
     env.db_path.unlink()
     make_v0(env.db_path).close()
@@ -275,3 +270,85 @@ def test_transcript_dash_leading_relative_path_safe(env, tmp_path, monkeypatch):
     # 相対パスは resolve 済みの絶対パスで渡る
     assert calls and calls[0][calls[0].index("-m") + 2] == "index"
     assert any(a.startswith("--file=/") for a in calls[0])
+
+
+def _seed_sessions(env, n=3, cwd="/Users/x/proj", slug="Users-x-proj"):
+    c = sqlite3.connect(str(env.db_path))
+    for i in range(n):
+        sid = f"seed-{cwd}-{i}"
+        c.execute(
+            "INSERT INTO sessions(session_id, project_path, ended_at, cwd) VALUES (?,?,?,?)",
+            (sid, slug, f"2026-09-{(i % 28) + 1:02d}T00:00:00Z", cwd),
+        )
+        c.execute(
+            "INSERT INTO segments(session_id, role, content, timestamp) VALUES (?,?,?,?)",
+            (sid, "user", f"question number {i}", "t"),
+        )
+    c.commit()
+    c.close()
+
+
+def test_session_start_outputs_context(env, capsys):
+    _seed_sessions(env, 2)
+    _seed_sessions(env, 2, cwd="/Users/x/other", slug="Users-x-other")
+    assert hooks.dispatch("session-start", payload(env, source="startup")) == 0
+    out = json.loads(capsys.readouterr().out)
+    hso = out["hookSpecificOutput"]
+    assert hso["hookEventName"] == "SessionStart"
+    assert hso["additionalContext"].count("\n- [") == 2
+    assert "(1 segments)" in hso["additionalContext"]
+
+
+@pytest.mark.parametrize("source", ["startup", "clear", "compact"])
+def test_session_start_accepted_sources(env, capsys, source):
+    _seed_sessions(env, 1)
+    hooks.dispatch("session-start", payload(env, source=source))
+    assert "SessionStart" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("source", ["resume", None])
+def test_session_start_other_sources_silent(env, capsys, source):
+    _seed_sessions(env, 1)
+    extra = {} if source is None else {"source": source}
+    hooks.dispatch("session-start", payload(env, **extra))
+    assert capsys.readouterr().out == ""
+
+
+def test_session_start_empty_db_silent(env, capsys):
+    hooks.dispatch("session-start", payload(env, source="startup"))
+    assert capsys.readouterr().out == ""
+
+
+def test_session_start_no_cwd_or_db_silent(env, capsys):
+    hooks.dispatch("session-start", json.dumps({"source": "startup"}))
+    env.db_path.unlink()
+    hooks.dispatch("session-start", payload(env, source="startup"))
+    assert capsys.readouterr().out == ""
+    assert not env.db_path.exists()  # hook never creates the DB
+
+
+def test_session_start_old_schema_silent_and_unchanged(env, capsys):
+    env.db_path.unlink()
+    make_v0(env.db_path).close()
+    hooks.dispatch("session-start", payload(env, source="startup"))
+    assert capsys.readouterr().out == ""
+    assert "myak migrate" in env.log.read_text()
+    c = sqlite3.connect(str(env.db_path))
+    assert c.execute("PRAGMA user_version").fetchone()[0] == 0
+    c.close()
+
+
+def test_session_start_fast_with_300_sessions(env, capsys):
+    _seed_sessions(env, 300)
+    t0 = time.perf_counter()
+    hooks.handle_session_start(json.loads(payload(env, source="startup")))
+    assert time.perf_counter() - t0 < 0.3
+
+
+def test_session_start_excludes_current_session(env, capsys):
+    _seed_sessions(env, 2)
+    cur = "seed-/Users/x/proj-1"
+    hooks.dispatch("session-start", payload(env, source="startup", session_id=cur))
+    ctx = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
+    assert ctx.count("\n- [") == 1
+    assert "question number 1" not in ctx

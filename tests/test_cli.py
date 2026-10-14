@@ -171,7 +171,7 @@ def test_migrate_dry_run_and_real(env, capsys):
     assert str(backups[0]) in out
     assert oct(backups[0].stat().st_mode & 0o777) == "0o600"
     c = sqlite3.connect(str(env.db_path))
-    assert c.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert c.execute("PRAGMA user_version").fetchone()[0] == 2
     c.close()
 
     assert cli.main(["migrate"]) == 0
@@ -398,3 +398,15 @@ def test_launcher_no_event_exits_zero(tmp_path):
 
 def test_launcher_is_executable_template():
     assert os.access(LAUNCHER, os.X_OK)
+
+
+def test_migrate_moves_v1_to_v2(env, capsys):
+    from tests.test_db_migration import make_v1
+
+    env.db_path.unlink()
+    make_v1(env.db_path).close()
+    assert cli.main(["migrate"]) == 0
+    assert list((env.tmp / "state" / "backups").glob("memory.db.bak-v1-*"))
+    c = sqlite3.connect(str(env.db_path))
+    assert c.execute("PRAGMA user_version").fetchone()[0] == 2
+    c.close()

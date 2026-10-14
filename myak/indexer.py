@@ -5,6 +5,7 @@ Stop hook から stdin 経由、または CLI 引数で呼ばれる。
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -301,6 +302,10 @@ def run_from_cli(argv=None):
         "--final", action="store_true",
         help="Accept an unterminated tail line (default behaviour of this command)",
     )
+    parser.add_argument(
+        "--embed", action="store_true",
+        help="After indexing, embed pending segments if myak[vec] and the model are present",
+    )
     args = parser.parse_args(argv)
 
     if args.file:
@@ -330,6 +335,18 @@ def run_from_cli(argv=None):
         print(f"Indexed {count} segments from {jsonl_path.name}")
     finally:
         conn.close()
+    if args.embed:
+        from myak import config, vec
+
+        # 分離された子プロセスなので CPU を譲る (onnxruntime のスレッド数も抑える)
+        os.environ.setdefault("OMP_NUM_THREADS", "2")
+        try:
+            os.nice(10)
+        except OSError:
+            pass
+        # フック経路ではダウンロードしない。1 回の上限を設け、残りは次回以降に回す
+        n, reason = vec.try_embed_pending(limit=config.HOOK_EMBED_LIMIT)
+        print(f"Embedded {n} segments" if reason is None else f"Embedding skipped: {reason}")
 
 
 def main():

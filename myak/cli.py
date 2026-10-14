@@ -34,8 +34,21 @@ def build_parser():
     mig = sub.add_parser("migrate", help="Migrate the database schema (explicit only)")
     mig.add_argument("--dry-run", action="store_true", help="Print version and counts only")
 
+    cl = sub.add_parser(
+        "clean-legacy", help="Apply noise filters retroactively to legacy (uuid-less) rows"
+    )
+    cl.add_argument("--dry-run", action="store_true", help="Print counts and examples only")
+
     re = sub.add_parser("reindex", help="Reset cursors and re-run backfill")
     re.add_argument("--full", action="store_true", help="Required: confirm a full reindex")
+
+    em = sub.add_parser("embed", help="Embed pending segments for hybrid search (needs myak[vec])")
+    em.add_argument("--limit", type=int, default=None, help="Max segments to embed")
+    em.add_argument("--model", default=None, help="Embedding model id (fastembed)")
+    em.add_argument(
+        "--rebuild", action="store_true",
+        help="Discard the existing vector index (required to switch --model)",
+    )
 
     sub.add_parser("install-hooks", help="Install the hook launcher and print settings snippet")
 
@@ -192,8 +205,16 @@ def main(argv=None):
         return dispatch(args.event, stdin_text)
     if args.command == "migrate":
         return cmd_migrate(args.dry_run)
+    if args.command == "clean-legacy":
+        from myak import cleanup
+
+        return cleanup.run(args.dry_run)
     if args.command == "reindex":
         return cmd_reindex(args.full)
+    if args.command == "embed":
+        from myak import vec
+
+        return vec.run_embed(limit=args.limit, model=args.model, rebuild=args.rebuild)
     if args.command == "install-hooks":
         return cmd_install_hooks()
     if args.command == "migrate-settings":

@@ -8,7 +8,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-CURRENT_VERSION = 1
+CURRENT_VERSION = 2
 KEEP_BACKUPS = 3
 
 _V0_TABLES = """
@@ -71,6 +71,13 @@ _V1_STEPS = (
 )
 
 
+_CWD_INDEX = (
+    "CREATE INDEX IF NOT EXISTS sessions_cwd_ended ON sessions(cwd, ended_at)"
+)
+
+_V2_STEPS = (_CWD_INDEX,)
+
+
 class SchemaTooNew(RuntimeError):
     """DB の user_version がこのコードより新しい。"""
 
@@ -122,7 +129,7 @@ def _statements(script):
 
 
 def create_schema(conn):
-    """新規 DB を v1 で直接作成する。既存 DB (v0/v1) には何もしない。
+    """新規 DB を現行版で直接作成する。既存 DB (v0/v1) には何もしない。
 
     DDL と user_version は 1 つの BEGIN IMMEDIATE ... COMMIT で原子的に実行する。
     """
@@ -139,6 +146,8 @@ def create_schema(conn):
         )
         + _FTS_AND_TRIGGERS
         + _UUID_INDEX
+        + ";\n"
+        + _CWD_INDEX
         + ";"
     )
     if conn.in_transaction:
@@ -184,10 +193,15 @@ def _counts(conn):
     }
 
 
-def _prune_backups(dest_dir, db_name, keep=KEEP_BACKUPS):
-    """古いバックアップを削除し、新しい順に keep 個だけ残す。"""
+def _backup_prefix(tag):
+    """migrate (`bak-v*`) と clean-legacy (`bak-clean-*`) は別々に刈り込む。"""
+    return "bak-clean-" if tag == "clean" else "bak-v"
+
+
+def _prune_backups(dest_dir, db_name, keep=KEEP_BACKUPS, prefix="bak-v"):
+    """古いバックアップを削除し、新しい順に keep 個だけ残す (prefix ごと)。"""
     files = sorted(
-        dest_dir.glob(f"{db_name}.bak-v*"), key=lambda p: (p.stat().st_mtime_ns, p.name)
+        dest_dir.glob(f"{db_name}.{prefix}*"), key=lambda p: (p.stat().st_mtime_ns, p.name)
     )
     for old in files[:-keep]:
         try:
@@ -196,8 +210,32 @@ def _prune_backups(dest_dir, db_name, keep=KEEP_BACKUPS):
             pass
 
 
+def make_backup(conn, tag, backup_dir=None):
+    """DB のバックアップを取りパスを返す (インメモリ DB なら None)。古いものは刈り込む。"""
+    db_file = _db_file(conn)
+    if db_file is None:
+        return None
+    if backup_dir is not None:
+        dest_dir = Path(backup_dir)
+    else:
+        from myak import config
+
+        dest_dir = config.ensure_state_dir() / "backups"
+    dest_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    backup_path = dest_dir / f"{db_file.name}.bak-{tag}-{stamp}"
+    os.close(os.open(str(backup_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+    dest = sqlite3.connect(str(backup_path))
+    try:
+        conn.backup(dest)
+    finally:
+        dest.close()
+    _prune_backups(dest_dir, db_file.name, prefix=_backup_prefix(tag))
+    return backup_path
+
+
 def migrate(conn, *, backup_dir=None):
-    """v0 → v1。明示的にのみ呼ぶ。結果 dict を返す。
+    """v0/v1 → 現行版。明示的にのみ呼ぶ。結果 dict を返す。
 
     バックアップは BEGIN IMMEDIATE の前に取る (バックアップ中も他プロセスの書き込みを
     止めないため)。バックアップ後〜ロック取得前の書き込みはバックアップに含まれないが、
@@ -223,29 +261,12 @@ def migrate(conn, *, backup_dir=None):
     _check_integrity(conn)
     before = _counts(conn)
 
-    backup_path = None
-    db_file = _db_file(conn)
-    if db_file is not None:
-        if backup_dir is not None:
-            dest_dir = Path(backup_dir)
-        else:
-            from myak import config
-
-            dest_dir = config.ensure_state_dir() / "backups"
-        dest_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        backup_path = dest_dir / f"{db_file.name}.bak-v{version}-{stamp}"
-        os.close(os.open(str(backup_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
-        dest = sqlite3.connect(str(backup_path))
-        try:
-            conn.backup(dest)
-        finally:
-            dest.close()
-        _prune_backups(dest_dir, db_file.name)
+    backup_path = make_backup(conn, f"v{version}", backup_dir)
 
     conn.execute("BEGIN IMMEDIATE")
     try:
-        for sql in _V1_STEPS:
+        steps = (_V1_STEPS if version < 1 else ()) + _V2_STEPS
+        for sql in steps:
             _exec(conn, sql)
         conn.execute(f"PRAGMA user_version={CURRENT_VERSION}")
         conn.execute("COMMIT")
