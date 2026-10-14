@@ -13,6 +13,41 @@ Persistent memory for Claude Code. Indexes session transcripts into SQLite FTS5 
 5. **Manual search.** `myak query` from the terminal.
 6. **Obsidian export.** `myak export` writes Markdown notes per project.
 
+## When to use myak (and when not)
+
+myak is a **raw archive with search**, not a summarizer. It stores what was actually said in your sessions (including subagent transcripts) and lets hooks and tools pull it back by full-text or vector search. Nothing is rewritten by an LLM, so indexing costs no API calls and nothing leaves your machine.
+
+### Good fit
+
+- You work across many repos and want "what did we decide about X, and why" to be searchable months later, without maintaining notes.
+- You want recall to be free and offline: no API key, no cloud account, no per-token cost for indexing.
+- Your sessions are long and multi-agent. Subagent transcripts are indexed too, ranked lower so they do not drown out the main thread.
+- You write in Japanese (or mixed Japanese/English). The FTS index is trigram-based, so recall works without a word tokenizer, and the optional vector model is multilingual.
+- You already sync `~/.claude` between machines and want one shared memory database with machine-local state kept out of the sync.
+- You keep notes in Obsidian and want session history exported there.
+
+### Poor fit
+
+- You want compressed, curated summaries instead of raw snippets. myak injects short excerpts; it does not distill a session into a narrative.
+- You need memory shared with non-Claude agents or across a team. myak is local and single-user by design (the MCP server and CLI work from other tools, but there is no hosted layer).
+- You want the agent to decide what to remember. myak remembers everything that passes the noise filter; `myak_save` exists for explicit notes, but there is no automatic "extract the important facts" step.
+- Your transcripts contain secrets you do not want on disk in plain text. The database is unencrypted SQLite.
+
+### How it compares
+
+| | myak | Claude Code auto memory (`MEMORY.md`) | claude-mem | Mem0 / Supermemory / Letta / Zep |
+|---|---|---|---|---|
+| What is stored | Raw user/assistant text, incl. subagents | Short curated notes Claude writes | LLM-compressed observations of tool use and edits | Extracted facts / graphs, often hosted |
+| Who decides | Everything above a noise filter | Claude, when it judges something worth saving | An LLM compression step | The agent via memory tools, or an extraction pipeline |
+| Cost to index | None (local SQLite, optional local embeddings) | None | API tokens per session | API tokens; cloud plans for hosted tiers |
+| Scope | One user, synced across their machines | One repo, one machine | One machine | Multi-agent, multi-user, framework-agnostic |
+| Recall | Hook injection (FTS) + hybrid search via CLI/MCP | Loaded at session start (first 200 lines) | Hook injection of compressed context | MCP tools the agent calls |
+| Best at | "Find what was actually said" across projects | Preferences and standing rules | Dense per-session context for the next session | Personalization, shared/team memory, temporal facts |
+
+Use `MEMORY.md` and `CLAUDE.md` for rules and preferences, and myak for the searchable record. They do not overlap. See [Coexistence with Claude Code auto memory](#coexistence-with-claude-code-auto-memory-memorymd).
+
+Comparisons reflect the public descriptions of those projects as of October 2026 and may be out of date.
+
 ## Requirements
 
 - Python 3.12+, managed by [uv](https://docs.astral.sh/uv/)
