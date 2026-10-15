@@ -15,7 +15,7 @@ import pytest
 
 from myak import config, query, vec
 from tests._vec_skip import require_sqlite_vec
-from tests.corpus_helpers import SESSION_A, SESSION_B, build_corpus
+from tests.corpus_helpers import SESSION_A, SESSION_B, SESSION_C, build_corpus
 from tests.fakes import FakeEmbedder
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "eval_search.py"
@@ -1210,3 +1210,293 @@ def test_exit_codes_are_the_documented_ones():
     assert (ev.EXIT_INCOMPARABLE, ev.EXIT_UNEXPECTED) == (3, 4)
     for code in range(5):
         assert re.search(rf"^\s+{code}\s", ev.__doc__, re.MULTILINE)
+
+
+# ------------------------------------------------- recency and negative slices
+
+
+NEG = "negative"
+
+
+def negative_row(qid, text, **extra):
+    return {"qid": qid, "type": "negative", "query": text, **extra}
+
+
+def recency_row(qid, seg, session, text, old=None):
+    extra = {} if old is None else {"supersedes": {"segment_id": old[0], "session_id": old[1]}}
+    return query_row(qid, seg, session, "recency", text, **extra)
+
+
+def test_load_queries_accepts_negative_and_recency_pairs(tmp_path):
+    rows = [
+        negative_row("n1", "  run the tests  "),
+        recency_row("r1", 6, SESSION_C, "garage door", old=(1, SESSION_A)),
+        recency_row("r2", 5, SESSION_C, "rollout"),
+    ]
+    neg, pair, plain = ev.load_queries(write_eval_dir(tmp_path, rows) / "queries.jsonl")
+    assert (neg.type, neg.segment_id, neg.session_id, neg.text) == (
+        "negative", None, None, "run the tests")
+    assert neg.negative and not pair.negative
+    assert (pair.supersedes, pair.supersedes_session) == (1, SESSION_A)
+    assert (plain.supersedes, plain.supersedes_session) == (None, None)
+
+
+@pytest.mark.parametrize(
+    ("row", "needle"),
+    [
+        (negative_row("n", "SECRET-QUERY-TEXT", segment_id=1), "name no target"),
+        (negative_row("n", "SECRET-QUERY-TEXT", session_id="s" * 36), "name no target"),
+        (negative_row("n", "SECRET-QUERY-TEXT", supersedes={}), "name no target"),
+        ({"qid": "r", "type": "recency", "query": "SECRET-QUERY-TEXT"}, "segment_id"),
+        (query_row("l", 1, "s" * 36, "lexical", "SECRET-QUERY-TEXT",
+                   supersedes={"segment_id": 2, "session_id": "s" * 36}), "only allowed"),
+        (query_row("r", 1, "s" * 36, "recency", "SECRET-QUERY-TEXT", supersedes=2),
+         "must be an object"),
+        (query_row("r", 1, "s" * 36, "recency", "SECRET-QUERY-TEXT",
+                   supersedes={"segment_id": 2}), "supersedes.session_id"),
+        (query_row("r", 1, "s" * 36, "recency", "SECRET-QUERY-TEXT",
+                   supersedes={"segment_id": True, "session_id": "s" * 36}),
+         "supersedes.segment_id"),
+        (query_row("r", 1, "s" * 36, "recency", "SECRET-QUERY-TEXT",
+                   supersedes={"segment_id": 1, "session_id": "s" * 36}), "different segment"),
+    ],
+)
+def test_load_queries_rejects_bad_negative_and_recency_rows(tmp_path, row, needle):
+    path = write_eval_dir(tmp_path, [row]) / "queries.jsonl"
+    with pytest.raises(ev.EvalInputError, match=r"queries\.jsonl:1") as exc:
+        ev.load_queries(path)
+    assert needle in str(exc.value) and "SECRET" not in str(exc.value)
+
+
+def test_queries_digest_unchanged_without_pairs_and_sensitive_to_supersedes():
+    a = ev.EvalQuery("a", 1, "s1", "lexical", "alpha")
+    legacy = hashlib.sha256("a\t1\ts1\tlexical\talpha".encode()).hexdigest()
+    assert ev.queries_digest([a]) == legacy  # older baselines stay comparable
+    pair = ev.EvalQuery("r", 2, "s2", "recency", "beta", supersedes=1, supersedes_session="s1")
+    other = ev.EvalQuery("r", 2, "s2", "recency", "beta", supersedes=3, supersedes_session="s1")
+    plain = ev.EvalQuery("r", 2, "s2", "recency", "beta")
+    assert len({ev.queries_digest([q]) for q in (pair, other, plain)}) == 3
+
+
+def age_segment(db_path, seg, stamp="2026-03-01T12:00:00.000Z"):
+    rw = sqlite3.connect(str(db_path), isolation_level=None)
+    rw.execute("UPDATE segments SET timestamp = ? WHERE id = ?", (stamp, seg))
+    rw.close()
+
+
+def test_validate_queries_negative_always_usable_and_stale_supersedes(corpus):
+    age_segment(corpus.db_path, 1)
+    queries = [
+        ev.EvalQuery("neg", None, None, "negative", "run the tests"),
+        ev.EvalQuery("pair", 6, SESSION_C, "recency", "garage", 1, SESSION_A),
+        ev.EvalQuery("old-gone", 6, SESSION_C, "recency", "garage", 99, SESSION_A),
+        ev.EvalQuery("old-moved", 6, SESSION_C, "recency", "garage", 1, SESSION_B),
+    ]
+    conn = ev.open_readonly(corpus.db_path)
+    try:
+        usable, stale, ambiguous = ev.validate_queries(conn, queries)
+    finally:
+        conn.close()
+    assert [q.qid for q in usable] == ["neg", "pair"]
+    assert [q.qid for q in stale] == ["old-gone", "old-moved"]
+    assert ambiguous == 0
+
+
+@pytest.mark.parametrize("old_stamp", ["2026-10-14T12:00:00.000Z", "2026-10-20T00:00:00Z", None])
+def test_validate_queries_rejects_a_pair_whose_target_is_not_newer(corpus, old_stamp):
+    age_segment(corpus.db_path, 1, old_stamp)  # same time, later, or no timestamp
+    swapped = ev.EvalQuery("swapped", 6, SESSION_C, "recency", "SECRET-QUERY-TEXT", 1, SESSION_A)
+    conn = ev.open_readonly(corpus.db_path)
+    try:
+        with pytest.raises(ev.EvalInputError, match="qid swapped: .*newer") as exc:
+            ev.validate_queries(conn, [swapped])
+    finally:
+        conn.close()
+    assert "SECRET" not in str(exc.value)
+
+
+def test_score_query_negative_and_pair():
+    results = res((6, "cccccccc"), (1, "aaaaaaaa"))
+    neg = ev.score_query(ev.EvalQuery("n", None, None, "negative", "x y z"), results, 5, 1.0)
+    assert (neg.segment_rank, neg.session_rank, neg.n_results, neg.pair) == (None, None, 2, False)
+    pair_q = ev.EvalQuery("p", 6, SESSION_C, "recency", "garage", 1, SESSION_A)
+    pair = ev.score_query(pair_q, results, 5, 1.0)
+    assert (pair.segment_rank, pair.supersedes_rank, pair.pair) == (1, 2, True)
+    assert ev.score_query(pair_q, results, 1, 1.0).supersedes_rank is None  # beyond k
+
+
+def pair_outcome(seg, old, qtype="recency"):
+    return ev.Outcome("p", qtype, seg, seg, 3, 1.0, pair=True, supersedes_rank=old)
+
+
+def test_summarize_pairs_hand_computed():
+    outcomes = [
+        pair_outcome(1, 2),        # newer first
+        pair_outcome(2, None),     # newer first: the old one is gone
+        pair_outcome(3, 1),        # older first
+        pair_outcome(None, 4),     # older first: the new one is missing
+        pair_outcome(None, None),  # neither
+        outcome("recency", seg=1, sess=1, n=1),  # not a pair: ignored
+    ]
+    pairs = ev.summarize_pairs(outcomes)
+    assert pairs == {"pairs_n": 5, "newer_first_rate": 0.4, "older_first_rate": 0.4}
+    assert ev.summarize_pairs([outcome("recency", seg=1)]) is None
+    by_type = ev.summarize_by_type(outcomes + [outcome("lexical", seg=1)])
+    assert by_type["recency"]["n"] == 6 and by_type["recency"]["pairs_n"] == 5
+    assert "pairs_n" not in by_type["lexical"] and "pairs_n" not in ev.summarize(outcomes)
+    assert "pairs_n" not in ev.summarize_by_type([outcome("recency", seg=1)])["recency"]
+
+
+def test_summarize_mean_results():
+    assert ev.summarize([outcome(n=3), outcome(n=0)])["mean_results"] == 1.5
+    assert ev.summarize([])["mean_results"] is None
+
+
+def test_summarize_negative_hand_computed():
+    outcomes = [outcome(NEG, n=0, ms=1), outcome(NEG, n=3, ms=2), outcome(NEG, n=3, ms=3),
+                outcome(NEG, n=1, ms=4)]
+    m = ev.summarize_negative(outcomes, 5)
+    assert m["n"] == 4 and m["empty_rate"] == 0.25 and m["mean_results"] == 1.75
+    assert m["fill_rate"] == 0.35  # 1.75 of 5 slots
+    assert m["results_hist"] == {"0": 1, "1": 1, "3": 2}
+    assert m["latency_p50_ms"] == 2.5
+    empty = ev.summarize_negative([], 5)
+    assert empty["n"] == 0 and empty["fill_rate"] is None and empty["results_hist"] == {}
+
+
+
+def test_evaluate_pipeline_keeps_negatives_out_of_ranking_metrics(monkeypatch):
+    monkeypatch.setitem(ev.PIPELINES, "fake", lambda text, k: res((1, "aaaaaaaa")))
+    queries = [
+        ev.EvalQuery("a", 1, "aaaaaaaa-x", "lexical", "one"),
+        ev.EvalQuery("r", 1, "aaaaaaaa-x", "recency", "two", 2, "bbbbbbbb-x"),
+        ev.EvalQuery("n", None, None, "negative", "three"),
+    ]
+    entry = ev.evaluate_pipeline("fake", queries, 5)
+    assert entry["overall"]["n"] == 2 and entry["overall"]["hit_at_1"] == 1.0
+    assert set(entry["by_type"]) == {"lexical", "recency"}
+    assert entry["by_type"]["recency"]["newer_first_rate"] == 1.0
+    assert entry["negative"]["n"] == 1 and entry["negative"]["fill_rate"] == 0.2  # 1 of 5
+    per_query = {p["qid"]: p for p in entry["per_query"]}
+    assert per_query["r"]["supersedes_rank"] is None and "supersedes_rank" not in per_query["a"]
+    assert per_query["n"]["segment_rank"] is None and per_query["n"]["n_results"] == 1
+    no_neg = ev.evaluate_pipeline("fake", queries[:1], 5)
+    assert "negative" not in no_neg
+
+
+def negative_metrics(n, empty, mean, depth=5):
+    return {"n": n, "empty_rate": empty, "mean_results": mean, "fill_rate": mean / depth,
+            "results_hist": {}}
+
+
+def with_negative(metrics):
+    report = make_report(0.8, 0.5, by_type={})
+    report["pipelines"]["fts"]["negative"] = metrics
+    return report
+
+
+def test_negative_slice_gates_an_empty_rate_drop_and_a_fill_rate_rise():
+    base = with_negative(negative_metrics(30, 0.5, 1.0))
+    out = ev.compare_reports(with_negative(negative_metrics(30, 0.4, 2.0)), base, 0.03)
+    assert regressed(out) == [("fts", "negative", "empty_rate"), ("fts", "negative", "fill_rate")]
+    assert out["deltas"]["fts"]["negative"] == {
+        "empty_rate": pytest.approx(-0.1), "mean_results": pytest.approx(1.0),
+        "fill_rate": pytest.approx(0.2)}
+    # more results for the same prompts, same empty rate: still a regression
+    out = ev.compare_reports(with_negative(negative_metrics(30, 0.5, 1.5)), base, 0.03)
+    assert regressed(out) == [("fts", "negative", "fill_rate")]
+    # less noise passes, and so does a rise of exactly the threshold
+    quieter = with_negative(negative_metrics(30, 0.6, 0.5))
+    assert ev.compare_reports(quieter, base, 0.03)["regressions"] == []
+    edge = with_negative({**negative_metrics(30, 0.5, 1.0), "fill_rate": 0.23})
+    assert ev.compare_reports(edge, with_negative(negative_metrics(30, 0.5, 1.0)), 0.03)[
+        "regressions"] == []
+
+
+def test_recency_pair_rate_is_compared_but_not_gated():
+    base = make_report(0.8, 0.5, by_type={
+        "recency": {**slice_metrics(40, 0.8, 0.5), "pairs_n": 40, "newer_first_rate": 0.9}})
+    cur = make_report(0.8, 0.5, by_type={
+        "recency": {**slice_metrics(40, 0.8, 0.5), "pairs_n": 40, "newer_first_rate": 0.1}})
+    out = ev.compare_reports(cur, base, 0.03)
+    assert out["deltas"]["fts"]["recency"]["newer_first_rate"] == pytest.approx(-0.8)
+    assert out["regressions"] == []
+
+
+def test_negative_slice_below_min_n_or_missing_is_not_gated():
+    base = make_report(0.8, 0.5, by_type={})
+    base["pipelines"]["fts"]["negative"] = negative_metrics(29, 0.9, 0.1)
+    cur = make_report(0.8, 0.5, by_type={})
+    cur["pipelines"]["fts"]["negative"] = negative_metrics(29, 0.0, 3.0)
+    out = ev.compare_reports(cur, base, 0.03)
+    assert out["regressions"] == [] and out["ungated"] == [("fts", "negative")]
+    del base["pipelines"]["fts"]["negative"]
+    assert "negative" not in ev.compare_reports(cur, base, 0.03)["deltas"]["fts"]
+
+
+def test_recency_slice_is_gated_like_the_other_query_types():
+    base = make_report(0.8, 0.5, by_type={"recency": slice_metrics(30, 0.9, 0.7)})
+    cur = make_report(0.8, 0.5, by_type={"recency": slice_metrics(30, 0.5, 0.7)})
+    out = ev.compare_reports(cur, base, 0.03)
+    assert regressed(out) == [("fts", "recency", "session_hit_at_5")]
+
+
+def test_format_table_shows_negative_row_mean_and_pairs():
+    targeted = [outcome("recency", seg=1, sess=1, n=2),
+                ev.Outcome("p", "recency", 2, 1, 3, 1.0, pair=True, supersedes_rank=1)]
+    entry = {"depth": 5, "cold_ms": 1.0, "overall": ev.summarize(targeted),
+             "by_type": ev.summarize_by_type(targeted),
+             "negative": ev.summarize_negative([outcome(NEG, n=3), outcome(NEG, n=0)], 3)}
+    report = {"k": 5, "pipelines": {"hook": entry}}
+    table = ev.format_table(report)
+    assert re.search(r"negative\s+2\s+-\s+-\s+-\s+-\s+0\.500\s+1\.50\s", table)
+    assert re.search(r"recency\s+2\s.*\s2\.50\s", table)
+    assert "recency pairs, newer first / older first: hook 0.000/1.000 (n=1)" in table
+    comparison = {
+        "comparable": True, "problems": [], "notes": [],
+        "deltas": {"hook": {"all": {"mrr_at_k": 0.0},
+                            "recency": {"newer_first_rate": 0.25},
+                            "negative": {"empty_rate": -0.1, "mean_results": 0.5,
+                                         "fill_rate": 0.167}}},
+        "regressions": [("hook", "negative", "empty_rate", -0.1)], "ungated": [],
+    }
+    rendered = ev.format_comparison(comparison, 0.03)
+    assert re.search(
+        r"negative\s+-\s+-\s+-\s+-\s+-0\.100\s+\+0\.500\s+\+0\.167\s+-\s+FAIL", rendered)
+    assert re.search(r"recency\s+(-\s+){7}\+0\.250\s+ok", rendered)
+    assert "negative: empty rate drop or fill rise > 0.03" in rendered
+
+
+def test_main_end_to_end_with_recency_and_negative(corpus, tmp_path, capsys):
+    age_segment(corpus.db_path, 1)
+    rows = QUERY_ROWS + [
+        recency_row("r1", 6, SESSION_C, "garage door installation", old=(1, SESSION_A)),
+        negative_row("n1", "garage notes please"),
+        negative_row("n2", "zzzz qqqq xxxx"),
+    ]
+    eval_dir = write_eval_dir(tmp_path / "eval", rows)
+    status, out, _ = run_main(["--eval-dir", str(eval_dir), "--pipelines", "hook,fts"], capsys)
+    assert status == 0
+    assert "negative" in out and "recency pairs" in out
+    (report_path,) = list((eval_dir / "runs").glob("*.json"))
+    report = json.loads(report_path.read_text())
+    assert report["queries"]["by_type"] == {"lexical": 2, "semantic": 1, "recency": 1,
+                                            "negative": 2}
+    assert report["queries"]["evaluated"] == 6
+    for name in ("hook", "fts"):
+        pdata = report["pipelines"][name]
+        assert pdata["overall"]["n"] == 4  # negatives are not in the ranking metrics
+        recency = pdata["by_type"]["recency"]
+        assert (recency["pairs_n"], recency["newer_first_rate"], recency["older_first_rate"]) == (
+            1, 1.0, 0.0)
+        assert pdata["negative"]["n"] == 2 and pdata["negative"]["results_hist"]["0"] >= 1
+    raw = report_path.read_text()
+    assert "garage" not in raw and "zzzz" not in raw
+
+    # a saved baseline gates the new slices too (here: identical, so it passes)
+    assert run_main(["--eval-dir", str(eval_dir), "--pipelines", "hook,fts",
+                     "--save-baseline"], capsys)[0] == 0
+    status, out, _ = run_main(["--eval-dir", str(eval_dir), "--pipelines", "hook,fts"], capsys)
+    assert status == 0
+    assert re.search(r"negative\s+(-\s+){4}(\+0\.000\s+){3}-\s+n<30", out)
+    assert re.search(r"recency\s+(\+0\.000\s+){6}-\s+\+0\.000\s+n<30", out)
