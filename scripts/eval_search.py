@@ -6,6 +6,10 @@ paths and reports ranking quality and latency. It never writes to the databases.
     uv run --extra vec python scripts/eval_search.py [--eval-dir DIR] [--k 5]
         [--pipelines hook,fts,hybrid] [--baseline PATH] [--save-baseline] [--threshold 0.03]
 
+Query types: lexical / semantic / recency name a target segment (recency: a recent one, optionally
+with the older segment it supersedes); negative names none and measures how much is returned for
+a prompt that needs no past memory.
+
 Pipelines (each calls the production functions; ranking is not re-implemented here):
     hook    UserPromptSubmit auto-injection: FTS + hook filters, capped at HOOK_MAX_RESULTS
     fts     `myak query --no-hybrid`: FTS + filter_hybrid
@@ -44,12 +48,17 @@ from myak import search as search_mod
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-REPORT_SCHEMA = 2  # 2: usable-set digest, clock block, clamped decay, per-pipeline sources
+# 2: usable-set digest, clock block, clamped decay, per-pipeline sources. Added later without a
+# bump (older baselines stay comparable): mean_results, recency pair rates, the negative block.
+REPORT_SCHEMA = 2
 DEFAULT_FROZEN_NOW = "2026-10-15T00:00:00Z"
 DEFAULT_K = query.MAX_RESULTS  # production default depth
 DEFAULT_THRESHOLD = 0.03
 PIPELINE_NAMES = ("hook", "fts", "hybrid")
-QUERY_TYPES = ("lexical", "semantic")
+TARGETED_TYPES = ("lexical", "semantic", "recency")  # a target segment; ranking metrics
+NEGATIVE = "negative"  # no target: only the amount returned is measured
+QUERY_TYPES = (*TARGETED_TYPES, NEGATIVE)
+REPORTED_TYPES = ("lexical", "semantic")  # always counted in the report, even when zero
 MIN_QUERY_CHARS = 3  # same floor as the CLI / MCP entry points
 SESSION_PREFIX_LEN = 8  # search results only carry session_id[:8]
 SESSION_HIT_CUTOFF = 5
@@ -58,7 +67,13 @@ MIN_GATE_N = 30  # a per-type slice is gated only when it has at least this many
 CLOCK_DRIFT_DAYS = 1.0  # warn when the newest segment is this much later than frozen_now
 
 GATE_METRICS = ("session_hit_at_5", "mrr_at_k")
-COMPARE_METRICS = ("hit_at_1", "hit_at_5", "mrr_at_k", "session_hit_at_5", "empty_rate")
+# negative slice: fewer prompts with nothing returned, or more results per prompt, is worse
+NEGATIVE_GATE_METRICS = ("empty_rate", "fill_rate")
+RISING_IS_WORSE = frozenset({"fill_rate"})  # every other gate metric fails on a drop
+COMPARE_METRICS = (
+    "hit_at_1", "hit_at_5", "mrr_at_k", "session_hit_at_5", "empty_rate", "mean_results",
+    "fill_rate", "newer_first_rate",
+)
 
 EXIT_OK = 0
 EXIT_REGRESSION = 1
@@ -74,10 +89,16 @@ class EvalInputError(Exception):
 @dataclass(frozen=True)
 class EvalQuery:
     qid: str | int
-    segment_id: int
-    session_id: str
+    segment_id: int | None  # None only for negative queries
+    session_id: str | None
     type: str
     text: str
+    supersedes: int | None = None  # recency pairs: the older segment the target replaces
+    supersedes_session: str | None = None
+
+    @property
+    def negative(self):
+        return self.type == NEGATIVE
 
 
 @dataclass(frozen=True)
@@ -89,6 +110,8 @@ class Outcome:
     n_results: int
     latency_ms: float
     vec_assisted: bool = False
+    pair: bool = False  # recency query with a superseded segment
+    supersedes_rank: int | None = None
 
 
 # --------------------------------------------------------------------------- input
@@ -97,6 +120,30 @@ class Outcome:
 def _require(cond, where, what):
     if not cond:
         raise EvalInputError(f"{where}: {what}")
+
+
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _require_target(seg, sid, where, label):
+    _require(_is_int(seg), where, f"{label}segment_id must be an integer")
+    _require(
+        isinstance(sid, str) and sid != "", where, f"{label}session_id must be a non-empty string"
+    )
+
+
+def _parse_supersedes(obj, seg, qtype, where):
+    """The optional "supersedes" target of a recency query -> (segment_id, session_id)."""
+    if "supersedes" not in obj:
+        return None, None
+    _require(qtype == "recency", where, "supersedes is only allowed on recency queries")
+    old = obj["supersedes"]
+    _require(isinstance(old, dict), where, "supersedes must be an object")
+    old_seg, old_sid = old.get("segment_id"), old.get("session_id")
+    _require_target(old_seg, old_sid, where, "supersedes.")
+    _require(old_seg != seg, where, "supersedes must name a different segment")
+    return old_seg, old_sid
 
 
 def _parse_query_line(raw, where):
@@ -114,17 +161,23 @@ def _parse_query_line(raw, where):
         isinstance(qid, (str, int)) and not isinstance(qid, bool) and qid != "",
         where, "qid must be a non-empty string or integer",
     )
-    _require(
-        isinstance(seg, int) and not isinstance(seg, bool),
-        where, "segment_id must be an integer",
-    )
-    _require(isinstance(sid, str) and sid != "", where, "session_id must be a non-empty string")
     _require(qtype in QUERY_TYPES, where, f"type must be one of {', '.join(QUERY_TYPES)}")
+    if qtype == NEGATIVE:
+        _require(
+            not {"segment_id", "session_id", "supersedes"} & obj.keys(),
+            where, "negative queries name no target (no segment_id / session_id / supersedes)",
+        )
+    else:
+        _require_target(seg, sid, where, "")
+    old_seg, old_sid = _parse_supersedes(obj, seg, qtype, where)
     _require(
         isinstance(text, str) and len(text.strip()) >= MIN_QUERY_CHARS,
         where, f"query must be a string of at least {MIN_QUERY_CHARS} characters",
     )
-    return EvalQuery(qid=qid, segment_id=seg, session_id=sid, type=qtype, text=text.strip())
+    return EvalQuery(
+        qid=qid, segment_id=seg, session_id=sid, type=qtype, text=text.strip(),
+        supersedes=old_seg, supersedes_session=old_sid,
+    )
 
 
 def load_queries(path):
@@ -176,10 +229,12 @@ def queries_digest(queries):
     Reports store the digest of the usable (actually scored) queries, so any change to what was
     evaluated makes a baseline incomparable.
     """
-    lines = sorted(
-        f"{q.qid}\t{q.segment_id}\t{q.session_id}\t{q.type}\t{q.text}" for q in queries
-    )
-    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+    def line(q):
+        base = f"{q.qid}\t{q.segment_id}\t{q.session_id}\t{q.type}\t{q.text}"
+        # appended only when set, so digests of sets without pairs stay as they were
+        return base if q.supersedes is None else f"{base}\t{q.supersedes}\t{q.supersedes_session}"
+
+    return hashlib.sha256("\n".join(sorted(map(line, queries))).encode("utf-8")).hexdigest()
 
 
 # ------------------------------------------------------------------ environment
@@ -265,25 +320,48 @@ def preflight_db():
 def validate_queries(conn, queries):
     """Split into (usable, stale, ambiguous_count).
 
-    stale: the segment is gone or now belongs to another session (ids shifted after a
-    re-index / cleanup), so the query can no longer be answered and is excluded.
+    stale: the segment (or the superseded segment of a recency pair) is gone or now belongs to
+    another session (ids shifted after a re-index / cleanup), so the query can no longer be
+    answered and is excluded. Negative queries have no target and are always usable. A usable
+    pair whose target is not newer than the superseded segment is an input error.
     ambiguous: the target's 8-char session prefix is shared by several sessions, which can
     inflate session hits (e.g. every `desktop-` session).
     """
-    ids = sorted({q.segment_id for q in queries})
-    owner = {}
+    ids = sorted(
+        {q.segment_id for q in queries if not q.negative}
+        | {q.supersedes for q in queries if q.supersedes is not None}
+    )
+    owner, stamps = {}, {}
     for start in range(0, len(ids), SQL_CHUNK):
         chunk = ids[start:start + SQL_CHUNK]
         marks = ",".join("?" * len(chunk))
-        owner.update(
-            conn.execute(f"SELECT id, session_id FROM segments WHERE id IN ({marks})", chunk)
-        )
-    usable = [q for q in queries if owner.get(q.segment_id) == q.session_id]
-    stale = [q for q in queries if owner.get(q.segment_id) != q.session_id]
+        for seg_id, session_id, stamp in conn.execute(
+            f"SELECT id, session_id, timestamp FROM segments WHERE id IN ({marks})", chunk
+        ):
+            owner[seg_id] = session_id
+            stamps[seg_id] = _parse_timestamp(stamp)
+
+    def answerable(q):
+        if q.negative:
+            return True
+        if owner.get(q.segment_id) != q.session_id:
+            return False
+        return q.supersedes is None or owner.get(q.supersedes) == q.supersedes_session
+
+    usable = [q for q in queries if answerable(q)]
+    stale = [q for q in queries if not answerable(q)]
+    for q in usable:
+        new, old = stamps.get(q.segment_id), stamps.get(q.supersedes)
+        if q.supersedes is not None and not (new and old and new > old):
+            raise EvalInputError(
+                f"qid {q.qid}: a recency target must be newer than the segment it supersedes"
+            )
     prefixes = Counter(
         row[0][:SESSION_PREFIX_LEN] for row in conn.execute("SELECT session_id FROM sessions")
     )
-    ambiguous = sum(1 for q in usable if prefixes[q.session_id[:SESSION_PREFIX_LEN]] > 1)
+    ambiguous = sum(
+        1 for q in usable if not q.negative and prefixes[q.session_id[:SESSION_PREFIX_LEN]] > 1
+    )
     return usable, stale, ambiguous
 
 
@@ -404,14 +482,19 @@ def session_rank(results, session_id, k):
 
 
 def score_query(q, results, k, latency_ms):
+    targeted = not q.negative
     return Outcome(
         qid=q.qid,
         type=q.type,
-        segment_rank=segment_rank(results, q.segment_id, k),
-        session_rank=session_rank(results, q.session_id, k),
+        segment_rank=segment_rank(results, q.segment_id, k) if targeted else None,
+        session_rank=session_rank(results, q.session_id, k) if targeted else None,
         n_results=len(results),
         latency_ms=latency_ms,
         vec_assisted=any(r.get("source") in ("vec", "both") for r in results),
+        pair=q.supersedes is not None,
+        supersedes_rank=(
+            None if q.supersedes is None else segment_rank(results, q.supersedes, k)
+        ),
     )
 
 
@@ -433,16 +516,53 @@ def _hit(rank, cutoff):
     return rank is not None and rank <= cutoff
 
 
+def _ranked_first(rank, other):
+    """`rank` is in the results and above `other` (or `other` is absent)."""
+    return rank is not None and (other is None or rank < other)
+
+
+def summarize_pairs(outcomes):
+    """Recency pairs: how often the newer target ranks above the segment it supersedes.
+
+    newer_first: the target is in the results and above the superseded one (or that one is
+    absent); older_first: the reverse. Neither: both absent. None when there are no pairs.
+    """
+    pairs = [o for o in outcomes if o.pair]
+    if not pairs:
+        return None
+    n = len(pairs)
+    return {
+        "pairs_n": n,
+        "newer_first_rate": _rate(
+            sum(_ranked_first(o.segment_rank, o.supersedes_rank) for o in pairs), n
+        ),
+        "older_first_rate": _rate(
+            sum(_ranked_first(o.supersedes_rank, o.segment_rank) for o in pairs), n
+        ),
+    }
+
+
+def _latency(outcomes):
+    latencies = [o.latency_ms for o in outcomes]
+    return {
+        "latency_p50_ms": round(percentile(latencies, 50), 3),
+        "latency_p95_ms": round(percentile(latencies, 95), 3),
+    }
+
+
+def _mean_results(outcomes):
+    return round(sum(o.n_results for o in outcomes) / len(outcomes), 6)
+
+
 def summarize(outcomes):
     """Aggregate metrics for a list of Outcome. Empty input yields n=0 and None metrics."""
     n = len(outcomes)
     if n == 0:
         return {
             "n": 0, "hit_at_1": None, "hit_at_5": None, "mrr_at_k": None,
-            "session_hit_at_5": None, "empty_rate": None,
+            "session_hit_at_5": None, "empty_rate": None, "mean_results": None,
             "latency_p50_ms": None, "latency_p95_ms": None,
         }
-    latencies = [o.latency_ms for o in outcomes]
     return {
         "n": n,
         "hit_at_1": _rate(sum(_hit(o.segment_rank, 1) for o in outcomes), n),
@@ -452,22 +572,59 @@ def summarize(outcomes):
             sum(_hit(o.session_rank, SESSION_HIT_CUTOFF) for o in outcomes), n
         ),
         "empty_rate": _rate(sum(o.n_results == 0 for o in outcomes), n),
-        "latency_p50_ms": round(percentile(latencies, 50), 3),
-        "latency_p95_ms": round(percentile(latencies, 95), 3),
+        "mean_results": _mean_results(outcomes),
+        **_latency(outcomes),
+    }
+
+
+def summarize_negative(outcomes, depth):
+    """Negative queries (no target): how much is returned for a prompt that needs nothing.
+
+    fill_rate is mean_results / depth (the share of result slots used, 0..1). results_hist maps
+    a result count to the number of queries that got exactly that many.
+    """
+    n = len(outcomes)
+    if n == 0:
+        return {"n": 0, "empty_rate": None, "mean_results": None, "fill_rate": None,
+                "results_hist": {}, "latency_p50_ms": None, "latency_p95_ms": None}
+    counts = Counter(o.n_results for o in outcomes)
+    mean = _mean_results(outcomes)
+    return {
+        "n": n,
+        "empty_rate": _rate(counts[0], n),
+        "mean_results": mean,
+        "fill_rate": round(mean / depth, 6),
+        "results_hist": {str(c): counts[c] for c in sorted(counts)},
+        **_latency(outcomes),
     }
 
 
 def summarize_by_type(outcomes):
+    """Ranking metrics per targeted query type (negative queries are summarized apart).
+
+    The recency slice also carries the pair rates (summarize_pairs) when it has pairs.
+    """
     out = {}
-    for qtype in QUERY_TYPES:
+    for qtype in TARGETED_TYPES:
         subset = [o for o in outcomes if o.type == qtype]
         if subset:
-            out[qtype] = summarize(subset)
+            out[qtype] = {**summarize(subset), **(summarize_pairs(subset) or {})}
     return out
 
 
 def _elapsed_ms(started):
     return (time.perf_counter() - started) * 1000
+
+
+def _per_query(o):
+    row = {
+        "qid": o.qid, "type": o.type, "segment_rank": o.segment_rank,
+        "session_rank": o.session_rank, "n_results": o.n_results,
+        "latency_ms": round(o.latency_ms, 3),
+    }
+    if o.pair:
+        row["supersedes_rank"] = o.supersedes_rank
+    return row
 
 
 def evaluate_pipeline(name, queries, k):
@@ -487,20 +644,17 @@ def evaluate_pipeline(name, queries, k):
         started = time.perf_counter()
         results = runner(q.text, k)
         outcomes.append(score_query(q, results, k, _elapsed_ms(started)))
+    targeted = [o for o in outcomes if o.type != NEGATIVE]
+    negative = [o for o in outcomes if o.type == NEGATIVE]
     entry = {
         "depth": pipeline_depth(name, k),
         "cold_ms": cold_ms,
-        "overall": summarize(outcomes),
-        "by_type": summarize_by_type(outcomes),
-        "per_query": [
-            {
-                "qid": o.qid, "type": o.type, "segment_rank": o.segment_rank,
-                "session_rank": o.session_rank, "n_results": o.n_results,
-                "latency_ms": round(o.latency_ms, 3),
-            }
-            for o in outcomes
-        ],
+        "overall": summarize(targeted),  # targeted queries only: negatives have no target
+        "by_type": summarize_by_type(targeted),
+        "per_query": [_per_query(o) for o in outcomes],
     }
+    if negative:
+        entry[NEGATIVE] = summarize_negative(negative, entry["depth"])
     if name == "hybrid" and outcomes:
         entry["vec_assisted_rate"] = _rate(sum(o.vec_assisted for o in outcomes), len(outcomes))
     return entry
@@ -526,6 +680,12 @@ def git_info():
     return {"sha": sha, "dirty": dirty}
 
 
+def _type_counts(queries):
+    """Queries per type: lexical / semantic always, the other types when present."""
+    counts = Counter(q.type for q in queries)
+    return {t: counts[t] for t in QUERY_TYPES if t in REPORTED_TYPES or counts[t]}
+
+
 def build_report(
     *, k, frozen_now, loaded, usable, stale, ambiguous, pipelines, results, vector, clock
 ):
@@ -541,7 +701,7 @@ def build_report(
             "evaluated": len(usable),
             "stale": len(stale),
             "ambiguous_session_prefix": ambiguous,
-            "by_type": {t: sum(q.type == t for q in usable) for t in QUERY_TYPES},
+            "by_type": _type_counts(usable),
             "usable_sha256": queries_digest(usable),
         },
         "vector": vector if "hybrid" in pipelines else None,
@@ -628,13 +788,20 @@ def baseline_problems(current, baseline):
 
 
 def _gate_slices(cur_pipeline, base_pipeline):
-    """(slice, current metrics, baseline metrics) for the overall numbers and each query type."""
-    slices = [("all", cur_pipeline["overall"], base_pipeline["overall"])]
+    """(slice, current metrics, baseline metrics, gate metrics) present in both runs.
+
+    The overall numbers and each targeted query type are gated on GATE_METRICS; the negative
+    slice on NEGATIVE_GATE_METRICS. Recency pair rates are compared but never gated.
+    """
+    slices = [("all", cur_pipeline["overall"], base_pipeline["overall"], GATE_METRICS)]
     cur_types = cur_pipeline.get("by_type") or {}
     base_types = base_pipeline.get("by_type") or {}
-    for qtype in QUERY_TYPES:
+    for qtype in TARGETED_TYPES:
         if isinstance(cur_types.get(qtype), dict) and isinstance(base_types.get(qtype), dict):
-            slices.append((qtype, cur_types[qtype], base_types[qtype]))
+            slices.append((qtype, cur_types[qtype], base_types[qtype], GATE_METRICS))
+    cur_neg, base_neg = cur_pipeline.get(NEGATIVE), base_pipeline.get(NEGATIVE)
+    if isinstance(cur_neg, dict) and isinstance(base_neg, dict):
+        slices.append((NEGATIVE, cur_neg, base_neg, NEGATIVE_GATE_METRICS))
     return slices
 
 
@@ -643,8 +810,9 @@ def compare_reports(current, baseline, threshold):
 
     Fail closed: if the baseline is not comparable (different schema, k, frozen_now or evaluated
     query set) or does not cover every pipeline of the run, `comparable` is False and nothing is
-    gated. Otherwise every pipeline is gated on its overall numbers, and on each query type whose
-    slice has at least MIN_GATE_N queries in both runs.
+    gated. Otherwise every pipeline is gated on its overall numbers, and on each query type
+    (including negative: empty_rate must not drop, fill_rate must not rise) whose slice has at
+    least MIN_GATE_N queries in both runs.
 
     Returns {comparable, problems, deltas: {pipeline: {slice: {metric: delta}}},
              regressions: [(pipeline, slice, metric, delta)], ungated: [(pipeline, slice)], notes}.
@@ -672,7 +840,7 @@ def compare_reports(current, baseline, threshold):
         )
     for name, pdata in current["pipelines"].items():
         result["deltas"][name] = {}
-        for label, cur, base in _gate_slices(pdata, base_pipelines[name]):
+        for label, cur, base, gate_metrics in _gate_slices(pdata, base_pipelines[name]):
             deltas = {
                 m: round(cur[m] - base[m], 9)
                 for m in COMPARE_METRICS
@@ -684,8 +852,9 @@ def compare_reports(current, baseline, threshold):
                 continue
             result["regressions"] += [
                 (name, label, m, deltas[m])
-                for m in GATE_METRICS
-                if m in deltas and -deltas[m] > threshold
+                for m in gate_metrics
+                if m in deltas
+                and (deltas[m] if m in RISING_IS_WORSE else -deltas[m]) > threshold
             ]
     return result
 
@@ -749,21 +918,42 @@ def _render(rows, left=2):
     return "\n".join(lines)
 
 
+def _table_slices(pdata):
+    slices = [("all", pdata["overall"]), *pdata["by_type"].items()]
+    if isinstance(pdata.get(NEGATIVE), dict):
+        slices.append((NEGATIVE, pdata[NEGATIVE]))
+    return slices
+
+
 def format_table(report):
     k = report["k"]
-    rows = [["pipeline", "slice", "n", "hit@1", "hit@5", f"mrr@{k}", "sess@5", "empty",
+    rows = [["pipeline", "slice", "n", "hit@1", "hit@5", f"mrr@{k}", "sess@5", "empty", "mean",
              "p50ms", "p95ms"]]
     for name, pdata in report["pipelines"].items():
-        slices = [("all", pdata["overall"])] + list(pdata["by_type"].items())
-        for i, (label, m) in enumerate(slices):
+        for i, (label, m) in enumerate(_table_slices(pdata)):
             rows.append([
                 name if i == 0 else "", label, str(m["n"]),
-                _fmt(m["hit_at_1"]), _fmt(m["hit_at_5"]), _fmt(m["mrr_at_k"]),
-                _fmt(m["session_hit_at_5"]), _fmt(m["empty_rate"]),
+                _fmt(m.get("hit_at_1")), _fmt(m.get("hit_at_5")), _fmt(m.get("mrr_at_k")),
+                _fmt(m.get("session_hit_at_5")), _fmt(m["empty_rate"]),
+                _fmt(m.get("mean_results"), 2),
                 _fmt(m["latency_p50_ms"], 1), _fmt(m["latency_p95_ms"], 1),
             ])
+    lines = [_render(rows)]
+    pairs = {
+        name: pdata["by_type"].get("recency") or {}
+        for name, pdata in report["pipelines"].items()
+    }
+    if any(p.get("pairs_n") for p in pairs.values()):
+        lines.append(
+            "recency pairs, newer first / older first: " + ", ".join(
+                f"{n} {_fmt(p['newer_first_rate'])}/{_fmt(p['older_first_rate'])} "
+                f"(n={p['pairs_n']})"
+                for n, p in pairs.items() if p.get("pairs_n")
+            )
+        )
     cold = ", ".join(f"{n} {_fmt(p['cold_ms'], 1)}" for n, p in report["pipelines"].items())
-    return f"{_render(rows)}\ncold first query (ms): {cold}"
+    lines.append(f"cold first query (ms): {cold}")
+    return "\n".join(lines)
 
 
 def format_summary(report):
@@ -797,7 +987,8 @@ def format_comparison(comparison, threshold):
         lines += [f"  - {p}" for p in comparison["problems"]]
         lines.append(RESAVE_HINT)
         return "\n".join(lines)
-    rows = [["pipeline", "slice", "d_hit@1", "d_hit@5", "d_mrr", "d_sess@5", "d_empty", "gate"]]
+    rows = [["pipeline", "slice", "d_hit@1", "d_hit@5", "d_mrr", "d_sess@5", "d_empty", "d_mean",
+             "d_fill", "d_newer", "gate"]]
     failed = {(name, label) for name, label, _, _ in comparison["regressions"]}
     ungated = set(comparison["ungated"])
     for name, slices in comparison["deltas"].items():
@@ -810,8 +1001,9 @@ def format_comparison(comparison, threshold):
                 *(f"{d[m]:+.3f}" if m in d else "-" for m in COMPARE_METRICS), gate,
             ])
     lines = [
-        f"vs baseline (gate: session hit@5 / MRR drop > {threshold}; "
-        f"query-type slices gated at n >= {MIN_GATE_N}):",
+        f"vs baseline (gate: session hit@5 / MRR drop > {threshold}; negative: empty rate drop or "
+        f"fill rise > {threshold}; query-type slices gated at n >= {MIN_GATE_N}; "
+        "d_newer (recency pairs) not gated):",
         _render(rows, left=2),
     ]
     lines += [f"note: {n}" for n in comparison["notes"]]

@@ -4,7 +4,7 @@
 
 ## What it measures
 
-Each query names one target segment (and its session). The harness runs it through the three production paths, calling the same functions they use:
+Most queries name one target segment (and its session); `negative` queries name none (see below). The harness runs each query through the three production paths, calling the same functions they use:
 
 | Pipeline | Path | Notes |
 | --- | --- | --- |
@@ -12,13 +12,21 @@ Each query names one target segment (and its session). The harness runs it throu
 | `fts` | `myak query --no-hybrid` | FTS plus the standard threshold filters. |
 | `hybrid` | MCP `myak_search`, `myak query --hybrid` | FTS plus vector RRF. Falls back to FTS when vectors are unavailable, exactly like production; the report says so. |
 
-Per pipeline, overall and per query type (`lexical` / `semantic`):
+Per pipeline, overall and per targeted query type (`lexical` / `semantic` / `recency`):
 
 - segment Hit@1, Hit@5 and MRR@k (k is `--k`, default `MAX_RESULTS`, the production default, currently 5)
 - session Hit@5: any result from the target session counts. Results only carry an 8-character session prefix, so prefixes are compared.
-- empty-result rate
+- empty-result rate and mean number of results (`mean`)
 - latency p50/p95 per query, measured warm. The first query is run once beforehand; that cold time (model load, caches) is reported separately.
 - vector coverage (embedded rows vs segments) when `hybrid` runs
+- recency pairs (`recency` queries with `supersedes`): `newer_first_rate`, the share of pairs where the newer target is returned above the segment it supersedes (or that one is not returned), and `older_first_rate`, the reverse. Both absent counts for neither.
+
+`all` covers the targeted queries only. `negative` queries are reported in their own row:
+
+- `mean`: the mean number of results. For `hook` this is what gets injected into a prompt that needs no past memory; for `hybrid` it is what `myak_search` returns.
+- `fill_rate` in the report: `mean` divided by the pipeline's depth (3 for `hook`, `--k` otherwise), so pipelines compare on a 0 to 1 scale. Lower is better.
+- `empty`: the share of negative queries that got nothing. Higher is better here.
+- `results_hist` in the report: how many negative queries got 0, 1, 2, ... results.
 
 Time decay uses a frozen clock (`frozen_now`, default `2026-10-15T00:00:00Z`), so the passage of real time does not change the numbers. Production code is not changed for this; the harness patches the clock for the run only. Production's `time_decay_score` gives a timestamp later than "now" a multiplier above 1 that grows exponentially (30 days later: 2.0, 60 days: 4.0). Without a guard, every segment indexed after `frozen_now` would be boosted more and more. During the eval the harness therefore wraps `time_decay_score` so a timestamp later than `frozen_now` is clamped to `frozen_now` (decay 1.0) before the original function is called. The databases are opened read-only (`mode=ro`, `query_only`), including the attached vector index.
 
@@ -40,6 +48,24 @@ The eval directory defaults to `~/.claude/myak-state/eval/`. Put `queries.jsonl`
 - Do not paste the segment text as the query; that tests nothing.
 - Lines with `"skip": true` and blank lines are ignored. `qid` must be unique.
 - Aim for 50+ queries, split across both types. With fewer, the metrics are noisy. A query type is gated on its own only with 30+ queries of that type.
+
+Known-item queries alone favour weak time decay when their targets are old: nothing in them is hurt by ranking an old segment first. Two more types cover that:
+
+`recency`: the target is a recent segment (for example from the last 30 days before `frozen_now`), phrased like a `lexical` query. When the same topic also has an older segment that the target replaces (a later decision, a fixed version of the same procedure), name it in `supersedes`; the query then also counts as a pair:
+
+```json
+{"qid": "r001", "segment_id": 5678, "session_id": "<full session uuid>", "type": "recency", "query": "<what you would type>", "supersedes": {"segment_id": 1234, "session_id": "<full session uuid>"}}
+```
+
+`supersedes` is only allowed on `recency` queries and must name a different, older segment: a pair whose target is not newer than the superseded segment (by segment timestamp) is an input error (exit `2`), because it would count the wrong way. When the superseded segment is gone or moved, the whole query counts as `stale`.
+
+`negative`: a prompt that needs no past memory (for example "run the tests" or "fix the lint errors"), written the way you would type it in a session. It has no target, so `segment_id`, `session_id` and `supersedes` must be absent:
+
+```json
+{"qid": "n001", "type": "negative", "query": "<a generic prompt>"}
+```
+
+Do not write prompts starting with `/`: the hook ignores them, so they measure nothing. Ranking metrics do not apply to negative queries; they are measured by how much is returned (see above).
 
 Optional `meta.json`: `{"frozen_now": "2026-10-15T00:00:00Z"}`. Change it only when you start a new eval set: a different `frozen_now` makes every older baseline incomparable.
 
@@ -74,7 +100,7 @@ Each run writes `<eval-dir>/runs/<UTC timestamp>-<git sha>.json` and prints a co
 
 The gate compares a run with `<eval-dir>/baseline.json` (or `--baseline PATH`). It fails closed: when the numbers cannot be compared, it exits `3` instead of passing silently.
 
-What is gated: for every pipeline in the run, session Hit@5 and MRR@k must not drop by more than `--threshold` (absolute, default `0.03`; a drop of exactly the threshold is allowed). The same two metrics are gated per query type (`lexical`, `semantic`) when that slice has at least 30 queries in both runs; smaller slices are shown as `n<30` and not gated.
+What is gated: for every pipeline in the run, session Hit@5 and MRR@k must not drop by more than `--threshold` (absolute, default `0.03`; a drop of exactly the threshold is allowed). The same two metrics are gated per query type (`lexical`, `semantic`, `recency`) when that slice has at least 30 queries in both runs; smaller slices are shown as `n<30` and not gated. The `negative` slice is gated under the same rules on two metrics where the bad direction differs: its empty rate must not drop by more than `--threshold` (more generic prompts get something back), and its `fill_rate` must not rise by more than `--threshold` (more results per generic prompt). Note the signs in the comparison: for `negative`, a positive `d_empty` is good. The recency pair rate is shown as `d_newer` but never gated; pair sets are usually small.
 
 A baseline is comparable only when all of these match, otherwise the result is exit `3` and nothing is gated:
 
