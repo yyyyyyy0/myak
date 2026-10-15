@@ -80,25 +80,30 @@ def matching_token_count(content, tokens):
 def filter_results(results, tokens, *, hook_mode=False):
     """閾値フィルタ + session dedupe。結果はスコア降順にソートされる。
 
-    source=="vec" (ベクトルのみ・語彙が一致しない意味的近傍) は、語彙前提の
-    トークン一致ガードと絶対スコア下限を免除する (相対スコア下限は適用)。
-    距離の足切りは検索側 (config.VEC_MAX_DISTANCE) で済んでいる。
+    スコア下限 (絶対・相対) は減衰前の FTS 関連度 `bm25` で判定し、並び順用の `score`
+    (時間減衰・subagent 重み・RRF 融合込み) とは比べない。減衰後の値で判定すると古い
+    ヒットほど落ち、RRF の融合スコアは bm25 とスケールが違うため。相対下限の基準は結果中の
+    最大 bm25 (both や、後でトークンガードに落ちる結果も含む)。
+    ベクトル由来 (source が vec / both) は検索側の距離の足切り (config.VEC_MAX_DISTANCE)
+    を通っているのでスコア下限を免除する。語彙前提のトークン一致ガードは vec だけ免除する。
+    source の無い結果は fts とみなす。fts の結果は bm25 を必ず持つ (search._result が付ける)。
     """
     if not results:
         return []
 
     results = sorted(results, key=lambda r: r["score"], reverse=True)
-    best = results[0]["score"]
+    best = max((r["bm25"] for r in results if r.get("bm25") is not None), default=0.0)
     filtered = []
     seen_sessions = set()
 
     for r in results:
-        vec_only = r.get("source") == "vec"
-        if not vec_only and r["score"] < MIN_ABSOLUTE_SCORE:
-            continue
-        if best > 0 and r["score"] < best * MIN_RELATIVE_SCORE:
-            continue
-        if not vec_only and len(tokens) >= TOKEN_MATCH_GUARD:
+        source = r.get("source", "fts")
+        if source == "fts":
+            if r["bm25"] < MIN_ABSOLUTE_SCORE:
+                continue
+            if best > 0 and r["bm25"] < best * MIN_RELATIVE_SCORE:
+                continue
+        if source != "vec" and len(tokens) >= TOKEN_MATCH_GUARD:
             if matching_token_count(r["content"], tokens) < MIN_MATCHING_TOKENS:
                 continue
         if hook_mode:

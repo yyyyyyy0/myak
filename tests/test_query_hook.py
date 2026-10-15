@@ -4,7 +4,7 @@ import io
 import json
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -20,7 +20,8 @@ from myak.query import main as query_main
 
 
 def _make_result(score, session_id="sess0001", content="テスト内容",
-                 timestamp="2025-03-20", project="test-project"):
+                 timestamp="2025-03-20", project="test-project", bm25=None):
+    """FTS のみの検索結果。bm25 (減衰前の語彙スコア) の既定は score と同じ (減衰なし)。"""
     return {
         "role": "user",
         "content": content,
@@ -28,6 +29,8 @@ def _make_result(score, session_id="sess0001", content="テスト内容",
         "session_id": session_id,
         "project": project,
         "score": score,
+        "source": "fts",
+        "bm25": score if bm25 is None else bm25,
     }
 
 
@@ -83,6 +86,19 @@ class TestFilterResults:
         filtered = filter_results(results, [])
         assert len(filtered) == 1
         assert filtered[0]["score"] == 1.0
+
+    def test_thresholds_judge_relevance_before_decay(self):
+        # 200 日前 (減衰 ~0.01) の強い一致と、今日の弱い一致
+        old_strong = _make_result(12.0 * 0.01, session_id="old00001", bm25=12.0)
+        recent_weak = _make_result(3.0, session_id="new00001", bm25=3.0)
+        filtered = filter_results([recent_weak, old_strong], [])
+        # 古さで落とさない / 新しさで弱い一致を通さない (3.0 < 12.0 * MIN_RELATIVE_SCORE)
+        assert filtered == [old_strong]
+
+    def test_decay_still_orders_the_kept_results(self):
+        old_strong = _make_result(10.0 * 0.01, session_id="old00001", bm25=10.0)
+        recent = _make_result(8.0, session_id="new00001", bm25=8.0)
+        assert filter_results([old_strong, recent], []) == [recent, old_strong]
 
     def test_token_match_guard(self):
         results = [_make_result(1.0, content="aaa bbb ccc ddd")]
@@ -284,6 +300,29 @@ class TestRunHook:
     def test_slash_command_empty(self, db_env):
         self._seed(db_env)
         assert run_hook(json.dumps({"prompt": "/データベース移行"})) == ""
+
+    def test_old_strong_match_survives_a_recent_weaker_one(self, db_env):
+        now = datetime.now(timezone.utc)
+        self._seed(db_env)
+        conn = sqlite3.connect(str(db_env.db_path))
+        rows = [
+            ("old0000100", "postgres migration checklist with rollback steps",
+             now - timedelta(days=200)),
+            ("new0000100", "postgres migration notes", now),
+        ]
+        for sid, content, ts in rows:
+            conn.execute("INSERT INTO sessions VALUES (?, 'x-proj')", (sid,))
+            conn.execute(
+                "INSERT INTO segments(session_id, role, content, timestamp) "
+                "VALUES (?, 'user', ?, ?)",
+                (sid, content, ts.isoformat()),
+            )
+        conn.commit()
+        conn.close()
+        out = run_hook(json.dumps({"prompt": "postgres migration checklist"}))
+        context = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        assert "rollback steps" in context  # 減衰後スコアの相対下限で落ちていた
+        assert context.index("migration notes") < context.index("rollback steps")  # 新しい順
 
 
 class TestMainHook:
