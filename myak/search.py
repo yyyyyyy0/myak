@@ -54,7 +54,8 @@ def _fetch_rows(conn, ids):
     return {r[0]: r[1:] for r in rows}
 
 
-def _result(row, base_score, source="fts"):
+def _result(row, base_score, source="fts", segment_id=None):
+    """検索結果 dict。`segment_id` は内部用 (評価ハーネス向け)。公開フォーマッタは参照しない。"""
     role, content, timestamp, session_id, project, agent_type = row
     score = _query.time_decay_score(timestamp, base_score)
     if agent_type is not None:
@@ -68,6 +69,7 @@ def _result(row, base_score, source="fts"):
         "score": score,
         "agent_type": agent_type,
         "source": source,
+        "segment_id": segment_id,
     }
 
 
@@ -129,6 +131,10 @@ def hybrid_search(query, max_results, *, use_vec=True, embedder=None):
         return []
     finally:
         conn.close()
-    results = [_result(rows[sid], b, sources[sid]) for sid, b in base.items() if sid in rows]
+    results = [
+        _result(rows[sid], score, sources[sid], segment_id=sid)
+        for sid, score in base.items()
+        if sid in rows
+    ]
     results.sort(key=lambda r: r["score"], reverse=True)
     return results[:max_results]
