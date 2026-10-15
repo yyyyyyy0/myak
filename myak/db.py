@@ -194,8 +194,9 @@ def _counts(conn):
 
 
 def _backup_prefix(tag):
-    """migrate (`bak-v*`) と clean-legacy (`bak-clean-*`) は別々に刈り込む。"""
-    return "bak-clean-" if tag == "clean" else "bak-v"
+    """migrate (`bak-v*`)・clean-legacy (`bak-clean-*`)・redact-secrets (`bak-redact-*`) は
+    別々に刈り込む。"""
+    return f"bak-{tag}-" if tag in ("clean", "redact") else "bak-v"
 
 
 def _prune_backups(dest_dir, db_name, keep=KEEP_BACKUPS, prefix="bak-v"):

@@ -39,6 +39,11 @@ def build_parser():
     )
     cl.add_argument("--dry-run", action="store_true", help="Print counts and examples only")
 
+    rs = sub.add_parser(
+        "redact-secrets", help="Redact API keys/tokens already stored in the database"
+    )
+    rs.add_argument("--dry-run", action="store_true", help="Print counts and segment ids only")
+
     re = sub.add_parser("reindex", help="Reset cursors and re-run backfill")
     re.add_argument("--full", action="store_true", help="Required: confirm a full reindex")
 
@@ -209,6 +214,10 @@ def main(argv=None):
         from myak import cleanup
 
         return cleanup.run(args.dry_run)
+    if args.command == "redact-secrets":
+        from myak import redact_db
+
+        return redact_db.run(args.dry_run)
     if args.command == "reindex":
         return cmd_reindex(args.full)
     if args.command == "embed":

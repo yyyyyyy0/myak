@@ -15,6 +15,7 @@ from myak.config import ensure_memory_dir, get_connection
 from myak.db import require_current
 from myak.indexer import init_db
 from myak.query import filter_hybrid, format_plain, search
+from myak.redact import redact
 
 DESKTOP_SESSION_PREFIX = "desktop-"
 MAX_CONTENT_CHARS = 4000
@@ -51,8 +52,9 @@ def save_memory(content, role="assistant", session_id=None):
             }
 
         timestamp = now.isoformat()
-        stored = content[:MAX_CONTENT_CHARS]  # safety net; the tool rejects longer input
-        uuid = "save:" + hashlib.sha1(content.encode("utf-8")).hexdigest()[:16]
+        redacted = redact(content)  # secrets never reach the DB (nor the dedupe hash)
+        stored = redacted[:MAX_CONTENT_CHARS]  # safety net; the tool rejects longer input
+        uuid = "save:" + hashlib.sha1(redacted.encode("utf-8")).hexdigest()[:16]
         conn.execute("BEGIN IMMEDIATE")
         try:
             conn.execute(

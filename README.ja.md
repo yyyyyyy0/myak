@@ -129,6 +129,7 @@ myak clean-legacy
 | `myak install-hooks` | ランチャーを書き出し、settings 用のスニペットを表示します。 |
 | `myak migrate-settings --mode {rewrite,remove} [--dry-run] [--path P] [--launcher L]` | `settings.json` 内の myak のエントリを編集します。`.bak` を書き出します。 |
 | `myak clean-legacy [--dry-run]` | uuid を持たない古い行にノイズフィルタを適用します。 |
+| `myak redact-secrets [--dry-run]` | DB に保存済みの API キーやトークンを伏せ字にします（新しいセグメントは索引時に伏せ字化されます）。`bak-redact-*` バックアップには平文が残るので、確認後に削除してください。 |
 | `myak embed [--limit N] [--model M] [--rebuild]` | 未処理のセグメントを埋め込みます（`myak[vec]` が必要）。`--model` は既知のモデルのみ受け付けます。既存のインデックスを別のモデルに切り替えるには `--rebuild` が必要です。 |
 
 従来のエイリアス（`myak-index`、`myak-query`、`myak-backfill`、`myak-export`、`myak-mcp`）は、1 リリースの間だけ残されます。

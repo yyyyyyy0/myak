@@ -129,6 +129,7 @@ All commands are subcommands of `myak`.
 | `myak install-hooks` | Write the launcher and print a settings snippet. |
 | `myak migrate-settings --mode {rewrite,remove} [--dry-run] [--path P] [--launcher L]` | Edit myak entries in `settings.json`. Writes a `.bak`. |
 | `myak clean-legacy [--dry-run]` | Apply noise filters to old rows without uuid. |
+| `myak redact-secrets [--dry-run]` | Redact API keys and tokens already stored in the database (new segments are redacted at index time). Writes a `bak-redact-*` backup that still holds the plaintext: delete it once verified. |
 | `myak embed [--limit N] [--model M] [--rebuild]` | Embed pending segments (needs `myak[vec]`). `--model` accepts known models only; switching an existing index to another model requires `--rebuild`. |
 
 Legacy aliases, kept for one release: `myak-index`, `myak-query`, `myak-backfill`, `myak-export`, `myak-mcp`.
