@@ -8,6 +8,10 @@ import re
 from pathlib import Path
 
 from myak.config import MAX_CONTENT_LENGTH, MIN_CONTENT_LENGTH
+from myak.redact import redact
+
+# 切り詰め前に伏せ字化する範囲の余白 (境界を跨ぐトークンを部分的に残さないため)
+REDACT_MARGIN = 1000
 
 # <tag>...</tag> ブロックを除去し、周囲のテキストは残す
 NOISE_TAGS = ("system-reminder", "task-notification", "side-sessions-event")
@@ -138,6 +142,7 @@ def record_to_segment(rec):
         return None
 
     text = clean_text(text, role)
+    text = redact(text[: MAX_CONTENT_LENGTH + REDACT_MARGIN])
     if len(text) < MIN_CONTENT_LENGTH:
         return None
 
