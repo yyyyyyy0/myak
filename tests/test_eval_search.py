@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -64,6 +65,11 @@ def write_eval_dir(path, rows=QUERY_ROWS, meta=None):
     if meta is not None:
         (path / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
     return path
+
+
+def eval_queries(rows):
+    return [ev.EvalQuery(r["qid"], r["segment_id"], r["session_id"], r["type"], r["query"])
+            for r in rows]
 
 
 def sha256(path):
@@ -301,6 +307,101 @@ def test_frozen_time_pins_decay_and_restores_clock():
     assert query.time_decay_score(stamp, 1.0) < 0.5  # real clock is much later than FROZEN
 
 
+def test_frozen_time_clamps_timestamps_later_than_frozen_now():
+    later = "2026-11-14T00:00:00Z"  # 30 days after FROZEN: unclamped decay would be 2.0
+    with mock.patch.object(query, "datetime", ev._frozen_datetime_class(FROZEN)):
+        assert query.time_decay_score(later, 1.0) == pytest.approx(2.0, rel=1e-3)  # the bug
+    with ev.frozen_time(FROZEN):
+        assert query.time_decay_score(later, 1.0) == pytest.approx(1.0)  # clamped to "now"
+        assert query.time_decay_score(later, 3.0) == pytest.approx(3.0)
+        assert query.time_decay_score("2027-10-15T00:00:00.000Z", 1.0) == pytest.approx(1.0)
+        # at and before frozen_now nothing changes
+        assert query.time_decay_score("2026-10-15T00:00:00Z", 1.0) == pytest.approx(1.0)
+        assert query.time_decay_score("2026-09-15T00:00:00Z", 1.0) == pytest.approx(0.5, rel=1e-3)
+
+
+def test_frozen_time_clamp_calls_the_original_function_and_restores_it(monkeypatch):
+    seen = []
+
+    def original(timestamp_str, base_score):
+        seen.append(timestamp_str)
+        return base_score * 0.25
+
+    monkeypatch.setattr(query, "time_decay_score", original)
+    with ev.frozen_time(FROZEN):
+        assert query.time_decay_score is not original
+        assert query.time_decay_score("2026-12-01T00:00:00Z", 4.0) == 1.0  # original ran
+        assert query.time_decay_score("2026-10-01T00:00:00Z", 4.0) == 1.0
+    assert seen == ["2026-10-15T00:00:00+00:00", "2026-10-01T00:00:00Z"]  # clamped / untouched
+    assert query.time_decay_score is original
+
+
+@pytest.mark.parametrize("stamp", ["not-a-date", "2026-12-01T00:00:00", None, 5])
+def test_frozen_time_leaves_unparseable_or_naive_timestamps_to_production(stamp):
+    """Whatever the original does with these (0.5 fallback or raising) must stay unchanged."""
+
+    def outcome_of():
+        try:
+            return query.time_decay_score(stamp, 1.0)
+        except Exception as exc:  # noqa: BLE001 - mirror production behaviour, whatever it is
+            return type(exc)
+
+    expected = outcome_of()
+    with ev.frozen_time(FROZEN):
+        assert outcome_of() == expected
+
+
+def test_rows_indexed_after_frozen_now_do_not_gain_ranking_boost(corpus):
+    """End to end through the real search path: a year-future row scores like one at frozen_now."""
+    rw = sqlite3.connect(str(corpus.db_path), isolation_level=None)
+
+    def top_score(stamp):
+        rw.execute("UPDATE segments SET timestamp = ?", (stamp,))
+        with ev.eval_environment(FROZEN):
+            results = ev.fts_pipeline("garage automobile repair", 10)
+        return next(r["score"] for r in results if r["segment_id"] == 1)
+
+    try:
+        at_frozen = top_score("2026-10-15T00:00:00.000Z")
+        year_later = top_score("2027-10-15T00:00:00.000Z")
+        week_earlier = top_score("2026-10-08T00:00:00.000Z")
+    finally:
+        rw.close()
+    assert year_later == pytest.approx(at_frozen)  # unclamped this would be about 4096x
+    assert week_earlier < at_frozen  # the decay still works for older rows
+
+
+def test_clock_info_measures_distance_from_frozen_now():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE segments(timestamp TEXT)")
+    assert ev.clock_info(conn, FROZEN) == {
+        "newest_segment_at": None, "days_after_frozen_now": None, "drift_warning": False,
+    }
+    conn.executemany(
+        "INSERT INTO segments VALUES (?)",
+        [("2026-10-01T00:00:00.000Z",), ("2026-10-16T00:00:00.000Z",)],
+    )
+    info = ev.clock_info(conn, FROZEN)
+    assert info["newest_segment_at"] == "2026-10-16T00:00:00.000Z"
+    assert info["days_after_frozen_now"] == 1.0 and info["drift_warning"] is False  # not > 1 day
+    conn.execute("INSERT INTO segments VALUES ('2026-10-16T00:00:01.000Z')")
+    assert ev.clock_info(conn, FROZEN)["drift_warning"] is True
+    conn.execute("DELETE FROM segments")
+    conn.execute("INSERT INTO segments VALUES ('zzz-not-a-date')")
+    odd = ev.clock_info(conn, FROZEN)
+    assert odd["days_after_frozen_now"] is None and odd["drift_warning"] is False
+    conn.close()
+
+
+def test_clock_warnings_text_and_silence():
+    quiet = {"clock": {"drift_warning": False}, "frozen_now": "2026-10-15T00:00:00Z"}
+    assert ev.clock_warnings(quiet) == [] and ev.clock_warnings({}) == []
+    loud = {"clock": {"drift_warning": True, "days_after_frozen_now": 12.5},
+            "frozen_now": "2026-10-15T00:00:00Z"}
+    (text,) = ev.clock_warnings(loud)
+    assert "12.5 days after frozen_now" in text and "Re-save the baseline" in text
+
+
 def test_open_readonly_rejects_writes_and_leaves_file_untouched(corpus):
     before = sha256(corpus.db_path)
     conn = ev.open_readonly(corpus.db_path)
@@ -480,28 +581,44 @@ def test_hybrid_pipeline_falls_back_to_fts_like_mcp(monkeypatch):
 # ---------------------------------------------------------------- baseline gate
 
 
-def make_report(sess, mrr, pipeline="fts", **over):
-    overall = {"hit_at_1": 0.5, "hit_at_5": 0.6, "mrr_at_k": mrr, "session_hit_at_5": sess,
-               "empty_rate": 0.1}
-    report = {"k": 10, "frozen_now": "2026-10-15T00:00:00Z", "queries": {"sha256": "abc"},
-              "pipelines": {pipeline: {"overall": overall}}}
+def make_report(sess, mrr, pipeline="fts", by_type=None, **over):
+    overall = {"n": 100, "hit_at_1": 0.5, "hit_at_5": 0.6, "mrr_at_k": mrr,
+               "session_hit_at_5": sess, "empty_rate": 0.1}
+    entry = {"overall": overall}
+    if by_type is not None:
+        entry["by_type"] = by_type
+    report = {
+        "schema": ev.REPORT_SCHEMA, "k": 5, "frozen_now": "2026-10-15T00:00:00Z",
+        "queries": {"usable_sha256": "abc", "evaluated": 100, "stale": 0},
+        "pipelines": {pipeline: entry},
+    }
     report.update(over)
     return report
+
+
+def slice_metrics(n, sess, mrr):
+    return {"n": n, "hit_at_1": 0.5, "hit_at_5": 0.6, "mrr_at_k": mrr,
+            "session_hit_at_5": sess, "empty_rate": 0.1}
+
+
+def regressed(comparison):
+    return [(p, label, m) for p, label, m, _ in comparison["regressions"]]
 
 
 def test_compare_reports_threshold_is_inclusive_of_equal_drop():
     base = make_report(0.80, 0.50)
     exactly = ev.compare_reports(make_report(0.77, 0.47), base, 0.03)
+    assert exactly["comparable"] is True
     assert exactly["regressions"] == []  # a drop of exactly 0.03 is allowed
-    assert exactly["deltas"]["fts"]["session_hit_at_5"] == pytest.approx(-0.03)
+    assert exactly["deltas"]["fts"]["all"]["session_hit_at_5"] == pytest.approx(-0.03)
 
 
 def test_compare_reports_flags_each_gate_metric():
     base = make_report(0.80, 0.50)
     sess = ev.compare_reports(make_report(0.769, 0.50), base, 0.03)
-    assert [(p, m) for p, m, _ in sess["regressions"]] == [("fts", "session_hit_at_5")]
+    assert regressed(sess) == [("fts", "all", "session_hit_at_5")]
     mrr = ev.compare_reports(make_report(0.80, 0.469), base, 0.03)
-    assert [(p, m) for p, m, _ in mrr["regressions"]] == [("fts", "mrr_at_k")]
+    assert regressed(mrr) == [("fts", "all", "mrr_at_k")]
     both = ev.compare_reports(make_report(0.5, 0.1), base, 0.03)
     assert len(both["regressions"]) == 2
 
@@ -515,22 +632,90 @@ def test_compare_reports_improvement_and_non_gate_drops_pass():
     assert ev.compare_reports(worse_empty, base, 0.03)["regressions"] == []
 
 
-def test_compare_reports_notes_for_incomparable_runs():
-    base = make_report(0.8, 0.5, pipeline="fts")
-    cur = make_report(0.8, 0.5, pipeline="hybrid", k=5, frozen_now="2026-01-01T00:00:00Z")
-    cur["queries"]["sha256"] = "different"
-    out = ev.compare_reports(cur, base, 0.03)
-    text = " ".join(out["notes"])
-    assert "k differs" in text and "frozen_now differs" in text
-    assert "query set differs" in text and "hybrid: not in baseline" in text
-    assert out["deltas"] == {} and out["regressions"] == []
-
-
 def test_compare_reports_skips_none_metrics():
     base = make_report(0.8, 0.5)
     base["pipelines"]["fts"]["overall"]["session_hit_at_5"] = None
     out = ev.compare_reports(make_report(0.0, 0.5), base, 0.03)
-    assert "session_hit_at_5" not in out["deltas"]["fts"] and out["regressions"] == []
+    assert "session_hit_at_5" not in out["deltas"]["fts"]["all"] and out["regressions"] == []
+
+
+@pytest.mark.parametrize(
+    ("override", "needle"),
+    [
+        ({"k": 10}, "k differs (run 5, baseline 10)"),
+        ({"frozen_now": "2026-01-01T00:00:00Z"}, "frozen_now differs"),
+        ({"queries": {"usable_sha256": "other", "evaluated": 99, "stale": 1}},
+         "evaluated query set differs (run 100 queries, baseline 99)"),
+        ({"schema": 1}, "report schema differs"),
+    ],
+)
+def test_compare_reports_incomparable_baseline_gates_nothing(override, needle):
+    base = make_report(0.8, 0.5)
+    base.update(override)
+    # the current numbers collapse; an incomparable baseline must still not gate (or compare)
+    out = ev.compare_reports(make_report(0.1, 0.1), base, 0.03)
+    assert out["comparable"] is False
+    assert any(needle in problem for problem in out["problems"]), out["problems"]
+    assert out["deltas"] == {} and out["regressions"] == []
+    assert ev.comparison_status(out) == ev.EXIT_INCOMPARABLE == 3
+
+
+def test_compare_reports_schema_mismatch_is_reported_alone():
+    base = make_report(0.8, 0.5, schema=1)
+    base["queries"] = {"sha256": "old"}  # old layout: other fields are not meaningful
+    out = ev.compare_reports(make_report(0.8, 0.5), base, 0.03)
+    assert len(out["problems"]) == 1 and "schema differs" in out["problems"][0]
+
+
+def test_compare_reports_pipeline_missing_from_baseline_is_incomparable_not_skipped():
+    base = make_report(0.8, 0.5, pipeline="hook")
+    cur = make_report(0.8, 0.5, pipeline="hook")
+    cur["pipelines"]["fts"] = cur["pipelines"]["hook"]
+    out = ev.compare_reports(cur, base, 0.03)
+    assert out["comparable"] is False
+    assert out["problems"] == ["fts is not in the baseline (baseline covers: hook)"]
+    assert out["deltas"] == {} and ev.comparison_status(out) == 3
+    cur["pipelines"]["hook"]["overall"]["mrr_at_k"] = 0.0  # a real regression is not gated either
+    assert ev.compare_reports(cur, base, 0.03)["regressions"] == []
+    garbage = {**base, "pipelines": {"hook": base["pipelines"]["hook"], "fts": {"no": "overall"}}}
+    assert ev.compare_reports(cur, garbage, 0.03)["comparable"] is False
+
+
+def test_compare_reports_stale_count_change_is_only_a_note():
+    base = make_report(0.8, 0.5)
+    cur = make_report(0.8, 0.5, queries={"usable_sha256": "abc", "evaluated": 100, "stale": 4})
+    out = ev.compare_reports(cur, base, 0.03)
+    assert out["comparable"] is True and "stale query count differs" in out["notes"][0]
+
+
+def test_per_type_slice_is_gated_when_both_runs_have_enough_queries():
+    base = make_report(0.8, 0.5, by_type={
+        "lexical": slice_metrics(30, 0.9, 0.7), "semantic": slice_metrics(60, 0.7, 0.4)})
+    cur = make_report(0.8, 0.5, by_type={  # overall identical; only the lexical slice collapses
+        "lexical": slice_metrics(30, 0.9, 0.6), "semantic": slice_metrics(60, 0.7, 0.4)})
+    out = ev.compare_reports(cur, base, 0.03)
+    assert regressed(out) == [("fts", "lexical", "mrr_at_k")]
+    assert out["deltas"]["fts"]["lexical"]["mrr_at_k"] == pytest.approx(-0.1)
+    assert out["deltas"]["fts"]["all"]["mrr_at_k"] == 0
+    assert ev.comparison_status(out) == ev.EXIT_REGRESSION == 1
+
+
+def test_per_type_slice_below_min_n_is_not_gated():
+    base = make_report(0.8, 0.5, by_type={
+        "lexical": slice_metrics(29, 0.9, 0.7), "semantic": slice_metrics(60, 0.7, 0.4)})
+    cur = make_report(0.8, 0.5, by_type={
+        "lexical": slice_metrics(29, 0.1, 0.1), "semantic": slice_metrics(29, 0.1, 0.1)})
+    out = ev.compare_reports(cur, base, 0.03)  # semantic is large in the baseline only
+    assert out["regressions"] == []
+    assert out["ungated"] == [("fts", "lexical"), ("fts", "semantic")]
+    assert out["comparable"] is True and ev.comparison_status(out) == 0
+
+
+def test_comparison_status_codes():
+    ok = ev.compare_reports(make_report(0.8, 0.5), make_report(0.8, 0.5), 0.03)
+    assert ev.comparison_status(ok) == 0
+    bad = ev.compare_reports(make_report(0.1, 0.5), make_report(0.8, 0.5), 0.03)
+    assert ev.comparison_status(bad) == 1
 
 
 def test_load_baseline_resolution_and_errors(tmp_path):
@@ -538,13 +723,63 @@ def test_load_baseline_resolution_and_errors(tmp_path):
     with pytest.raises(ev.EvalInputError, match="baseline not found"):
         ev.load_baseline(tmp_path / "nope.json", tmp_path)
     (tmp_path / "baseline.json").write_text(json.dumps(make_report(0.5, 0.5)))
-    assert ev.load_baseline(None, tmp_path)["k"] == 10
+    assert ev.load_baseline(None, tmp_path)["k"] == 5
     (tmp_path / "other.json").write_text("{broken")
     with pytest.raises(ev.EvalInputError, match="other.json"):
         ev.load_baseline(tmp_path / "other.json", tmp_path)
     (tmp_path / "other.json").write_text('{"k": 1}')
     with pytest.raises(ev.EvalInputError, match="not an eval report"):
         ev.load_baseline(tmp_path / "other.json", tmp_path)
+
+
+def report_for(*names, **over):
+    """A full-looking report covering `names`, stamped so merges can be traced."""
+    report = make_report(0.8, 0.5, pipeline=names[0])
+    report.update(created_at="NEW", git={"sha": "new"}, vector=None)
+    for name in names[1:]:
+        report["pipelines"][name] = report["pipelines"][names[0]]
+    report.update(over)
+    return report
+
+
+def test_merge_baseline_without_existing_is_the_report_with_sources():
+    merged, carried, dropped = ev.merge_baseline(None, report_for("hook"))
+    assert list(merged["pipelines"]) == ["hook"] and (carried, dropped) == ([], [])
+    assert merged["sources"] == {"hook": {"created_at": "NEW", "git": {"sha": "new"}}}
+
+
+def test_merge_baseline_keeps_pipelines_the_run_did_not_cover():
+    existing = report_for("hook", "fts", "hybrid", created_at="OLD", git={"sha": "old"},
+                          vector={"coverage": 0.5})
+    existing["pipelines"]["fts"] = {"overall": {**existing["pipelines"]["fts"]["overall"],
+                                                "mrr_at_k": 0.123}}
+    merged, carried, dropped = ev.merge_baseline(existing, report_for("hook"))
+    assert list(merged["pipelines"]) == ["hook", "fts", "hybrid"]
+    assert (carried, dropped) == (["fts", "hybrid"], [])
+    assert merged["pipelines"]["fts"]["overall"]["mrr_at_k"] == 0.123  # carried untouched
+    assert merged["sources"]["hook"]["created_at"] == "NEW"
+    assert merged["sources"]["fts"] == {"created_at": "OLD", "git": {"sha": "old"}}
+    assert merged["vector"] == {"coverage": 0.5}  # belongs to the carried hybrid entry
+    assert merged["created_at"] == "NEW"
+
+
+def test_merge_baseline_replaces_the_pipelines_the_run_did_cover():
+    existing = report_for("hook", "fts")
+    fresh = report_for("fts")
+    fresh["pipelines"]["fts"]["overall"]["mrr_at_k"] = 0.99
+    fresh["vector"] = {"coverage": 1.0}
+    merged, carried, _ = ev.merge_baseline(existing, fresh)
+    assert merged["pipelines"]["fts"]["overall"]["mrr_at_k"] == 0.99 and carried == ["hook"]
+    assert merged["vector"] == {"coverage": 1.0}
+
+
+@pytest.mark.parametrize("override", [{"k": 10}, {"schema": 1},
+                                      {"frozen_now": "2026-01-01T00:00:00Z"}])
+def test_merge_baseline_replaces_an_incomparable_baseline_and_reports_the_loss(override):
+    existing = report_for("hook", "fts", **override)
+    merged, carried, dropped = ev.merge_baseline(existing, report_for("hook"))
+    assert list(merged["pipelines"]) == ["hook"]
+    assert carried == [] and dropped == ["fts"]
 
 
 # -------------------------------------------------------------- report writing
@@ -598,10 +833,26 @@ def test_format_helpers_render_expected_cells():
     assert "cold first query (ms): hybrid 12.3" in table
     summary = ev.format_summary(report)
     assert "(dirty)" in summary and "stale 1" in summary and "coverage=0.833" in summary
-    comparison = {"deltas": {"fts": {"mrr_at_k": -0.1, "hit_at_1": 0.0}},
-                  "regressions": [("fts", "mrr_at_k", -0.1)], "notes": ["k differs"]}
+    comparison = {
+        "comparable": True, "problems": [], "notes": ["stale query count differs"],
+        "deltas": {"fts": {"all": {"mrr_at_k": -0.1, "hit_at_1": 0.0},
+                           "lexical": {"mrr_at_k": -0.1}, "semantic": {"mrr_at_k": 0.0}}},
+        "regressions": [("fts", "all", "mrr_at_k", -0.1)], "ungated": [("fts", "semantic")],
+    }
     rendered = ev.format_comparison(comparison, 0.03)
-    assert "-0.100" in rendered and "FAIL" in rendered and "note: k differs" in rendered
+    assert "-0.100" in rendered and "note: stale query count differs" in rendered
+    rows = {(line.split()[1] if line.split()[0] == "fts" else line.split()[0]): line
+            for line in rendered.splitlines()[2:5]}
+    assert rows["all"].endswith("FAIL") and rows["lexical"].endswith("ok")
+    assert rows["semantic"].endswith("n<30")
+
+
+def test_format_comparison_incomparable_lists_reasons_and_how_to_resave():
+    comparison = {"comparable": False, "problems": ["k differs (run 5, baseline 10)"],
+                  "deltas": {}, "regressions": [], "ungated": [], "notes": []}
+    rendered = ev.format_comparison(comparison, 0.03)
+    assert "nothing was gated" in rendered and "k differs (run 5, baseline 10)" in rendered
+    assert "--save-baseline" in rendered
 
 
 def test_hybrid_warnings_branches():
@@ -621,7 +872,8 @@ def test_hybrid_warnings_branches():
 
 def test_parse_args_defaults_and_validation(capsys):
     args = ev.parse_args([])
-    assert (args.k, args.pipelines, args.threshold) == (10, ["hook", "fts", "hybrid"], 0.03)
+    assert args.k == query.MAX_RESULTS == ev.DEFAULT_K  # the production default depth
+    assert (args.pipelines, args.threshold) == (["hook", "fts", "hybrid"], 0.03)
     assert args.eval_dir is None and args.baseline is None and args.save_baseline is False
     assert ev.parse_args(["--pipelines", "fts, hook,fts"]).pipelines == ["fts", "hook"]
     for bad in (["--pipelines", "nope"], ["--pipelines", ","], ["--k", "0"],
@@ -677,6 +929,11 @@ def test_main_fts_and_hook_end_to_end(corpus, tmp_path, capsys):
     assert report["queries"]["stale"] == 1
     assert report["queries"]["by_type"] == {"lexical": 2, "semantic": 1}
     assert report["frozen_now"] == "2026-10-15T00:00:00Z" and report["vector"] is None
+    assert report["schema"] == 2 and report["k"] == query.MAX_RESULTS
+    assert report["clock"] == {"newest_segment_at": "2026-10-14T12:00:00.000Z",
+                               "days_after_frozen_now": -0.5, "drift_warning": False}
+    # the digest covers the usable (scored) queries only: not the stale or the skipped one
+    assert report["queries"]["usable_sha256"] == ev.queries_digest(eval_queries(QUERY_ROWS))
     assert list(report["pipelines"]) == ["hook", "fts"]
     for name in ("hook", "fts"):
         overall = report["pipelines"][name]["overall"]
@@ -728,34 +985,228 @@ def test_main_uses_default_eval_dir_under_state_dir(corpus, capsys):
     assert list((config.STATE_DIR / "eval" / "runs").glob("*.json"))
 
 
+def run_main(argv, capsys):
+    status = ev.main(argv)
+    captured = capsys.readouterr()
+    return status, captured.out, captured.err
+
+
+def read_baseline(eval_dir):
+    return json.loads((Path(eval_dir) / "baseline.json").read_text())
+
+
 def test_main_baseline_save_compare_and_regression_gate(corpus, tmp_path, capsys):
     eval_dir = write_eval_dir(tmp_path / "eval")
     argv = ["--eval-dir", str(eval_dir), "--pipelines", "hook,fts"]
 
-    assert ev.main(argv + ["--save-baseline"]) == 0  # no baseline yet: nothing to compare
+    status, out, _ = run_main(argv + ["--save-baseline"], capsys)
+    assert status == 0  # no baseline yet: nothing to compare
     baseline_path = eval_dir / "baseline.json"
     assert baseline_path.is_file() and stat.S_IMODE(baseline_path.stat().st_mode) == 0o600
-    assert "vs baseline" not in capsys.readouterr().out
+    assert "vs baseline" not in out and "nothing was gated" in out
+    assert read_baseline(eval_dir)["k"] == query.MAX_RESULTS
 
-    assert ev.main(argv) == 0  # same code, same data: no deltas
-    out = capsys.readouterr().out
+    status, out, _ = run_main(argv, capsys)
+    assert status == 0  # same code, same data: no deltas
     assert "vs baseline" in out and "+0.000" in out and "FAIL" not in out
 
-    baseline = json.loads(baseline_path.read_text())
+    baseline = read_baseline(eval_dir)
     baseline["pipelines"]["fts"]["overall"]["mrr_at_k"] += 0.2
     baseline_path.write_text(json.dumps(baseline))
-    assert ev.main(argv) == 1
-    assert "FAIL" in capsys.readouterr().out
+    status, out, _ = run_main(argv, capsys)
+    assert status == 1 and "FAIL" in out
     assert ev.main(argv + ["--threshold", "0.25"]) == 0  # a 0.2 drop is inside the threshold
     capsys.readouterr()
 
     other = tmp_path / "explicit.json"  # explicit --baseline wins over baseline.json
     other.write_text(json.dumps({**baseline, "pipelines": {
+        **baseline["pipelines"],
         "fts": {"overall": {**baseline["pipelines"]["fts"]["overall"], "mrr_at_k": 0.0}}}}))
     assert ev.main(argv + ["--baseline", str(other)]) == 0
     capsys.readouterr()
 
-    assert ev.main(argv + ["--save-baseline"]) == 1  # gate fails, but the save is explicit
-    assert json.loads(baseline_path.read_text())["pipelines"]["fts"]["overall"][
+    status, out, _ = run_main(argv + ["--save-baseline"], capsys)
+    assert status == 1  # the gate fails, but the save is explicit ...
+    assert "saved anyway" in out and "regression" in out  # ... and the output says so
+    assert read_baseline(eval_dir)["pipelines"]["fts"]["overall"][
         "mrr_at_k"
     ] == pytest.approx(2 / 3, abs=1e-6)
+
+
+def test_main_without_baseline_says_nothing_was_gated(corpus, tmp_path, capsys):
+    eval_dir = write_eval_dir(tmp_path / "eval")
+    status, out, _ = run_main(["--eval-dir", str(eval_dir), "--pipelines", "fts"], capsys)
+    assert status == 0 and "no baseline to compare with" in out
+
+
+def test_main_corrupt_baseline_is_an_input_error(corpus, tmp_path, capsys):
+    eval_dir = write_eval_dir(tmp_path / "eval")
+    (eval_dir / "baseline.json").write_text("{broken")
+    status, _, err = run_main(["--eval-dir", str(eval_dir), "--pipelines", "fts"], capsys)
+    assert status == 2 and "baseline.json" in err
+
+
+def test_main_warns_and_records_when_corpus_is_newer_than_frozen_now(db_env, tmp_path, capsys):
+    build_corpus(db_env, day="2026-11-20").close()  # 36 days past the default frozen_now
+    eval_dir = write_eval_dir(tmp_path / "eval")
+    status, _, err = run_main(["--eval-dir", str(eval_dir), "--pipelines", "fts"], capsys)
+    assert status == 0
+    assert "warning: newest segment is 36.5 days after frozen_now" in err
+    (report_path,) = list((eval_dir / "runs").glob("*.json"))
+    clock = json.loads(report_path.read_text())["clock"]
+    assert clock["drift_warning"] is True and clock["days_after_frozen_now"] == 36.5
+    # the clamp keeps the metrics intact: the same query set still hits
+    overall = json.loads(report_path.read_text())["pipelines"]["fts"]["overall"]
+    assert overall["hit_at_1"] == pytest.approx(2 / 3, abs=1e-6)
+
+
+def test_main_partial_save_merges_into_the_existing_baseline(corpus, tmp_path, capsys):
+    eval_dir = write_eval_dir(tmp_path / "eval")
+    base = ["--eval-dir", str(eval_dir)]
+    assert ev.main(base + ["--pipelines", "hook,fts", "--save-baseline"]) == 0
+    baseline = read_baseline(eval_dir)
+    baseline["pipelines"]["fts"]["overall"]["session_hit_at_5"] = 0.123  # marker (< current)
+    (eval_dir / "baseline.json").write_text(json.dumps(baseline))
+    capsys.readouterr()
+
+    status, out, _ = run_main(base + ["--pipelines", "hook", "--save-baseline"], capsys)
+    assert status == 0 and "merged: kept fts" in out
+    merged = read_baseline(eval_dir)
+    assert list(merged["pipelines"]) == ["hook", "fts"]
+    assert merged["pipelines"]["fts"]["overall"]["session_hit_at_5"] == 0.123  # carried over
+    assert set(merged["sources"]) == {"hook", "fts"}
+    assert ev.main(base + ["--pipelines", "hook,fts"]) == 0  # still gates both pipelines
+
+
+def test_main_partial_baseline_makes_a_full_run_incomparable_not_ok(corpus, tmp_path, capsys):
+    eval_dir = write_eval_dir(tmp_path / "eval")
+    base = ["--eval-dir", str(eval_dir)]
+    status, out, _ = run_main(base + ["--pipelines", "hook", "--save-baseline"], capsys)
+    assert status == 0 and "does not cover fts, hybrid" in out
+
+    status, out, _ = run_main(base, capsys)  # all pipelines against a hook-only baseline
+    assert status == 3
+    assert "fts is not in the baseline (baseline covers: hook)" in out
+    assert "nothing was gated" in out and "--save-baseline" in out
+    assert ev.main(base + ["--pipelines", "hook"]) == 0  # what the baseline covers still gates
+    capsys.readouterr()
+
+    status, out, _ = run_main(base + ["--pipelines", "fts", "--save-baseline"], capsys)
+    assert status == 3 and "saved anyway" in out  # incomplete -> 3, but the merge is written
+    assert list(read_baseline(eval_dir)["pipelines"]) == ["hook", "fts"]
+    assert ev.main(base + ["--pipelines", "hook,fts"]) == 0
+
+
+def test_main_save_over_an_incomparable_baseline_replaces_it_and_says_what_was_dropped(
+    corpus, tmp_path, capsys
+):
+    eval_dir = write_eval_dir(tmp_path / "eval")
+    base = ["--eval-dir", str(eval_dir)]
+    assert ev.main(base + ["--pipelines", "hook,fts", "--save-baseline"]) == 0
+    capsys.readouterr()
+    status, out, _ = run_main(base + ["--pipelines", "hook", "--k", "3", "--save-baseline"], capsys)
+    assert status == 3 and "k differs (run 3, baseline 5)" in out
+    assert "dropped pipelines: fts" in out
+    replaced = read_baseline(eval_dir)
+    assert list(replaced["pipelines"]) == ["hook"] and replaced["k"] == 3
+
+
+def test_main_usable_set_change_makes_the_baseline_incomparable(corpus, tmp_path, capsys):
+    eval_dir = write_eval_dir(tmp_path / "eval")
+    base = ["--eval-dir", str(eval_dir), "--pipelines", "fts"]
+    assert ev.main(base + ["--save-baseline"]) == 0
+    capsys.readouterr()
+
+    edited = [{**QUERY_ROWS[0], "query": "garage repair notes"}, *QUERY_ROWS[1:]]
+    write_eval_dir(eval_dir, edited)
+    status, out, _ = run_main(base, capsys)
+    assert status == 3 and "evaluated query set differs (run 3 queries, baseline 3)" in out
+
+    gone = [QUERY_ROWS[0], QUERY_ROWS[1], {**QUERY_ROWS[2], "segment_id": 99}]  # one goes stale
+    write_eval_dir(eval_dir, gone)
+    status, out, _ = run_main(base, capsys)
+    assert status == 3 and "(run 2 queries, baseline 3)" in out
+
+    # a new query that cannot be evaluated does not change what was scored: still comparable
+    write_eval_dir(eval_dir, QUERY_ROWS + [query_row("late", 99, SESSION_A, "lexical", "gone")])
+    status, out, _ = run_main(base, capsys)
+    assert status == 0 and "stale query count differs (run 1, baseline 0)" in out
+
+    write_eval_dir(eval_dir)  # back to the saved set
+    assert ev.main(base) == 0
+
+
+def test_main_k_mismatch_is_incomparable(corpus, tmp_path, capsys):
+    eval_dir = write_eval_dir(tmp_path / "eval")
+    base = ["--eval-dir", str(eval_dir), "--pipelines", "hook,fts"]
+    assert ev.main(base + ["--save-baseline"]) == 0
+    capsys.readouterr()
+    status, out, _ = run_main(base + ["--k", "3"], capsys)
+    assert status == 3 and "k differs (run 3, baseline 5)" in out and "FAIL" not in out
+    assert ev.main(base + ["--k", "5"]) == 0
+
+
+def test_main_frozen_now_and_schema_mismatch_are_incomparable(corpus, tmp_path, capsys):
+    eval_dir = write_eval_dir(tmp_path / "eval")
+    base = ["--eval-dir", str(eval_dir), "--pipelines", "fts"]
+    assert ev.main(base + ["--save-baseline"]) == 0
+    capsys.readouterr()
+
+    write_eval_dir(eval_dir, meta={"frozen_now": "2026-10-16T00:00:00Z"})
+    status, out, _ = run_main(base, capsys)
+    assert status == 3 and "frozen_now differs" in out
+
+    write_eval_dir(eval_dir)
+    old = read_baseline(eval_dir)  # what a baseline from the first harness version looks like
+    old.update(schema=1)
+    old["queries"] = {"sha256": "x", "evaluated": 3, "total": 3, "stale": 0}
+    (eval_dir / "baseline.json").write_text(json.dumps(old))
+    status, out, _ = run_main(base, capsys)
+    assert status == 3 and "report schema differs (run 2, baseline 1)" in out
+
+
+def test_main_per_type_regression_fails_the_gate(corpus, tmp_path, capsys):
+    hit, miss = "garage automobile repair", "no such words anywhere"
+    rows = [query_row(f"l{i}", 1, SESSION_A, "lexical", hit if i % 2 else miss)
+            for i in range(30)]
+    rows += [query_row(f"s{i}", 4, SESSION_B, "semantic", "postgres migration checklist")
+             for i in range(3)]  # n=3: below the per-type gate
+    eval_dir = write_eval_dir(tmp_path / "eval", rows)
+    argv = ["--eval-dir", str(eval_dir), "--pipelines", "fts"]
+    assert ev.main(argv + ["--save-baseline"]) == 0
+    capsys.readouterr()
+
+    baseline = read_baseline(eval_dir)
+    fts = baseline["pipelines"]["fts"]
+    assert fts["by_type"]["lexical"]["n"] == 30 and fts["by_type"]["semantic"]["n"] == 3
+    fts["by_type"]["lexical"]["mrr_at_k"] += 0.2  # overall numbers stay untouched
+    fts["by_type"]["semantic"]["mrr_at_k"] += 0.5  # too small a slice to gate
+    (eval_dir / "baseline.json").write_text(json.dumps(baseline))
+
+    status, out, _ = run_main(argv, capsys)
+    assert status == 1
+    rows = out.split("vs baseline", 1)[1].splitlines()[2:5]  # all / lexical / semantic
+    lines = {(line.split()[1] if line.split()[0] == "fts" else line.split()[0]): line
+             for line in rows}
+    assert lines["lexical"].endswith("FAIL")
+    assert lines["all"].endswith("ok") and lines["semantic"].endswith("n<30")
+
+
+def test_main_unexpected_error_exits_4_without_echoing_text(corpus, tmp_path, capsys, monkeypatch):
+    eval_dir = write_eval_dir(tmp_path / "eval")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("SECRET-QUERY-TEXT garage automobile repair")
+
+    monkeypatch.setattr(ev, "run_evaluation", boom)
+    status, out, err = run_main(["--eval-dir", str(eval_dir), "--pipelines", "fts"], capsys)
+    assert status == 4
+    assert "unexpected error: RuntimeError" in err
+    assert "SECRET" not in err + out and "garage" not in err + out
+
+
+def test_exit_codes_are_the_documented_ones():
+    assert (ev.EXIT_OK, ev.EXIT_REGRESSION, ev.EXIT_INPUT_ERROR) == (0, 1, 2)
+    assert (ev.EXIT_INCOMPARABLE, ev.EXIT_UNEXPECTED) == (3, 4)
+    for code in range(5):
+        assert re.search(rf"^\s+{code}\s", ev.__doc__, re.MULTILINE)

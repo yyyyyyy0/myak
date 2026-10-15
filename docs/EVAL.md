@@ -14,13 +14,15 @@ Each query names one target segment (and its session). The harness runs it throu
 
 Per pipeline, overall and per query type (`lexical` / `semantic`):
 
-- segment Hit@1, Hit@5 and MRR@k (k is `--k`, default 10)
+- segment Hit@1, Hit@5 and MRR@k (k is `--k`, default `MAX_RESULTS`, the production default, currently 5)
 - session Hit@5: any result from the target session counts. Results only carry an 8-character session prefix, so prefixes are compared.
 - empty-result rate
 - latency p50/p95 per query, measured warm. The first query is run once beforehand; that cold time (model load, caches) is reported separately.
 - vector coverage (embedded rows vs segments) when `hybrid` runs
 
-Time decay uses a frozen clock (`frozen_now`, default `2026-10-15T00:00:00Z`) so results do not drift as your history ages. Production code is not changed for this; the harness patches the clock for the run only. The databases are opened read-only (`mode=ro`, `query_only`), including the attached vector index.
+Time decay uses a frozen clock (`frozen_now`, default `2026-10-15T00:00:00Z`), so the passage of real time does not change the numbers. Production code is not changed for this; the harness patches the clock for the run only. Production's `time_decay_score` gives a timestamp later than "now" a multiplier above 1 that grows exponentially (30 days later: 2.0, 60 days: 4.0). Without a guard, every segment indexed after `frozen_now` would be boosted more and more. During the eval the harness therefore wraps `time_decay_score` so a timestamp later than `frozen_now` is clamped to `frozen_now` (decay 1.0) before the original function is called. The databases are opened read-only (`mode=ro`, `query_only`), including the attached vector index.
+
+The clock does not freeze the corpus. **Results do drift as the corpus grows**: new sessions compete with your target segments in the ranking, `myak embed` changes vector coverage, and cleanup or re-indexing changes the rows. The harness records the newest segment timestamp in the report (`clock`) and prints a warning when it is more than 1 day after `frozen_now`. The warning means the corpus has moved since the eval set was frozen; it is not an error.
 
 `fts` and `hybrid` use `limit = --k`. The hook keeps its production limit.
 
@@ -37,9 +39,9 @@ The eval directory defaults to `~/.claude/myak-state/eval/`. Put `queries.jsonl`
 - `semantic`: the same intent in different words, with little word overlap. This is what vector search is for.
 - Do not paste the segment text as the query; that tests nothing.
 - Lines with `"skip": true` and blank lines are ignored. `qid` must be unique.
-- Aim for 50+ queries, split across both types. With fewer, the metrics are noisy.
+- Aim for 50+ queries, split across both types. With fewer, the metrics are noisy. A query type is gated on its own only with 30+ queries of that type.
 
-Optional `meta.json`: `{"frozen_now": "2026-10-15T00:00:00Z"}`. Change it only when you start a new eval set.
+Optional `meta.json`: `{"frozen_now": "2026-10-15T00:00:00Z"}`. Change it only when you start a new eval set: a different `frozen_now` makes every older baseline incomparable.
 
 Segment ids survive re-indexing only while the rows do. Queries whose segment is gone, or now belongs to another session, are excluded and counted as `stale`. Rebuild those queries if the number grows. Queries whose session prefix is shared by several sessions (for example every `desktop-` session) are counted as `ambiguous`; their session hits can be inflated.
 
@@ -50,7 +52,7 @@ The query set is derived from your private sessions. It must never be committed 
 ## Run
 
 ```bash
-uv run --extra vec python scripts/eval_search.py                  # all pipelines, k=10
+uv run --extra vec python scripts/eval_search.py                  # all pipelines, k=5
 uv run --extra vec python scripts/eval_search.py --pipelines fts  # one pipeline
 ```
 
@@ -58,11 +60,48 @@ uv run --extra vec python scripts/eval_search.py --pipelines fts  # one pipeline
 
 Each run writes `<eval-dir>/runs/<UTC timestamp>-<git sha>.json` and prints a compact table.
 
+## Exit status
+
+| Code | Meaning |
+| --- | --- |
+| `0` | OK. Also a first run with no baseline: the output says nothing was gated. |
+| `1` | Regression: a gate metric dropped by more than `--threshold` against the baseline. |
+| `2` | Input error: missing or invalid `queries.jsonl` / `meta.json` / baseline file, no database, outdated schema, or no evaluable queries. |
+| `3` | Baseline incomparable or incomplete. Nothing was gated; the output lists the reasons and how to re-save. |
+| `4` | Unexpected error. Only the exception type and raise site are printed, never query text. |
+
+## The baseline gate
+
+The gate compares a run with `<eval-dir>/baseline.json` (or `--baseline PATH`). It fails closed: when the numbers cannot be compared, it exits `3` instead of passing silently.
+
+What is gated: for every pipeline in the run, session Hit@5 and MRR@k must not drop by more than `--threshold` (absolute, default `0.03`; a drop of exactly the threshold is allowed). The same two metrics are gated per query type (`lexical`, `semantic`) when that slice has at least 30 queries in both runs; smaller slices are shown as `n<30` and not gated.
+
+A baseline is comparable only when all of these match, otherwise the result is exit `3` and nothing is gated:
+
+- report schema (a baseline written by an older harness version is incomparable; re-save it),
+- `k`,
+- `frozen_now`,
+- the evaluated query set: the digest covers the usable queries, i.e. those actually scored. Editing, adding or removing a query, or a query turning stale (segment gone or moved), changes it. A change in the stale count alone, with the same evaluated set, is only a note,
+- every pipeline in the run is present in the baseline. A baseline without `fts` cannot gate a run that includes `fts`.
+
+### Saving a baseline
+
+`--save-baseline` writes `<eval-dir>/baseline.json` after the comparison, even when the gate failed or was incomparable (the output says so). It merges per pipeline: if the existing baseline is comparable with the run (same schema, `k`, `frozen_now`, evaluated set), pipelines the run did not cover are kept and only the ones it covered are replaced, so `--pipelines hook --save-baseline` no longer drops `fts` and `hybrid`. Each pipeline's `sources` entry records when and at which commit it was measured. If the existing baseline is not comparable, it is replaced and the output lists the pipelines that were dropped. A baseline that does not cover every pipeline makes later full runs exit `3` until the missing ones are saved.
+
+### When to re-save the baseline
+
+Because results drift with the corpus, a baseline is only a fair reference for the corpus it was measured on. Re-save it:
+
+- on the old code (the last release or `main`) right before you check a release candidate, against the current database. The tidy sequence is: check out the old code, run `--save-baseline`, check out the candidate, run again, compare, all in one sitting;
+- after the corpus changed materially since it was saved: many new sessions indexed, `myak embed` run, a cleanup or re-index, or when the clock warning above appears;
+- after changing the eval set, `k` or `frozen_now` (the harness tells you with exit `3`);
+- to accept an intended trade-off after a regression (exit `1`). Old numbers stay in `runs/`.
+
+Do not re-save to silence a regression you have not understood.
+
 ## Before a release
 
 1. On the last release (or `main`), record a baseline: `scripts/eval_search.py --save-baseline`. This writes `<eval-dir>/baseline.json`.
 2. On the release candidate, run the harness again. It compares against `baseline.json` (or `--baseline PATH`) and prints the deltas.
-3. Exit status `1` means a pipeline's session Hit@5 or MRR@k dropped by more than `--threshold` (absolute, default `0.03`). Investigate before releasing. `2` means bad input (missing files, stale-only query set, outdated schema).
-4. If a drop is an intended trade-off, run again with `--save-baseline` to accept it. Old numbers stay in `runs/`.
-
-A baseline is only comparable when the query set, `k` and `frozen_now` match; the harness prints a note when they differ.
+3. Exit `1` means a gate metric dropped by more than `--threshold`. Investigate before releasing. Exit `3` means the comparison was not possible; fix the cause (see above) and re-save. Exit `2` is bad input, `4` an unexpected failure.
+4. If a drop is an intended trade-off, run again with `--save-baseline` to accept it.

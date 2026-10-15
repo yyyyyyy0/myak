@@ -3,7 +3,7 @@
 Replays a private query set against the real memory DB through the three production search
 paths and reports ranking quality and latency. It never writes to the databases.
 
-    uv run --extra vec python scripts/eval_search.py [--eval-dir DIR] [--k 10]
+    uv run --extra vec python scripts/eval_search.py [--eval-dir DIR] [--k 5]
         [--pipelines hook,fts,hybrid] [--baseline PATH] [--save-baseline] [--threshold 0.03]
 
 Pipelines (each calls the production functions; ranking is not re-implemented here):
@@ -11,7 +11,13 @@ Pipelines (each calls the production functions; ranking is not re-implemented he
     fts     `myak query --no-hybrid`: FTS + filter_hybrid
     hybrid  MCP `myak_search` / `myak query --hybrid`: FTS + vector RRF + filter_hybrid
 
-Exit status: 0 ok, 1 regression against the baseline, 2 bad input or environment.
+Exit status:
+    0  ok (including a first run with no baseline: nothing was gated)
+    1  regression against the baseline beyond --threshold
+    2  input error (missing/invalid queries, DB, baseline file; nothing evaluable)
+    3  baseline incomparable or incomplete: nothing was gated (the message says why and
+       how to re-save)
+    4  unexpected error (the exception type is printed, never query text)
 See docs/EVAL.md.
 """
 
@@ -26,6 +32,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import traceback
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -37,9 +44,9 @@ from myak import search as search_mod
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-REPORT_SCHEMA = 1
+REPORT_SCHEMA = 2  # 2: usable-set digest, clock block, clamped decay, per-pipeline sources
 DEFAULT_FROZEN_NOW = "2026-10-15T00:00:00Z"
-DEFAULT_K = 10
+DEFAULT_K = query.MAX_RESULTS  # production default depth
 DEFAULT_THRESHOLD = 0.03
 PIPELINE_NAMES = ("hook", "fts", "hybrid")
 QUERY_TYPES = ("lexical", "semantic")
@@ -47,13 +54,17 @@ MIN_QUERY_CHARS = 3  # same floor as the CLI / MCP entry points
 SESSION_PREFIX_LEN = 8  # search results only carry session_id[:8]
 SESSION_HIT_CUTOFF = 5
 SQL_CHUNK = 500
+MIN_GATE_N = 30  # a per-type slice is gated only when it has at least this many queries
+CLOCK_DRIFT_DAYS = 1.0  # warn when the newest segment is this much later than frozen_now
 
 GATE_METRICS = ("session_hit_at_5", "mrr_at_k")
 COMPARE_METRICS = ("hit_at_1", "hit_at_5", "mrr_at_k", "session_hit_at_5", "empty_rate")
 
 EXIT_OK = 0
 EXIT_REGRESSION = 1
-EXIT_ERROR = 2
+EXIT_INPUT_ERROR = 2
+EXIT_INCOMPARABLE = 3
+EXIT_UNEXPECTED = 4
 
 
 class EvalInputError(Exception):
@@ -160,7 +171,11 @@ def load_frozen_now(eval_dir):
 
 
 def queries_digest(queries):
-    """Order-independent fingerprint of the eval set (to warn when a baseline is not comparable)."""
+    """Order-independent fingerprint of a query list.
+
+    Reports store the digest of the usable (actually scored) queries, so any change to what was
+    evaluated makes a baseline incomparable.
+    """
     lines = sorted(
         f"{q.qid}\t{q.segment_id}\t{q.session_id}\t{q.type}\t{q.text}" for q in queries
     )
@@ -179,10 +194,39 @@ def _frozen_datetime_class(instant):
     return FrozenDatetime
 
 
+def _clamp_timestamp(timestamp_str, instant):
+    """`timestamp_str`, or `instant` (ISO) when it is later than `instant`.
+
+    Anything the production parser would reject (non-str, naive, malformed) is returned
+    unchanged so the original function handles it exactly as in production.
+    """
+    if not isinstance(timestamp_str, str):
+        return timestamp_str
+    try:
+        ts = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+        later = ts.tzinfo is not None and ts > instant
+    except ValueError:
+        return timestamp_str
+    return instant.isoformat() if later else timestamp_str
+
+
 @contextlib.contextmanager
 def frozen_time(instant):
-    """Make myak.query's time decay see `instant` as "now" (production code is untouched)."""
-    with mock.patch.object(query, "datetime", _frozen_datetime_class(instant)):
+    """Make myak.query's time decay see `instant` as "now" (production code is untouched).
+
+    time_decay_score gives a timestamp later than "now" a multiplier above 1 that grows
+    exponentially, so rows indexed after `instant` would be boosted more and more. The wrapper
+    clamps such timestamps to `instant` (decay 1.0) before calling the original function.
+    """
+    original = query.time_decay_score
+
+    def clamped(timestamp_str, base_score):
+        return original(_clamp_timestamp(timestamp_str, instant), base_score)
+
+    with (
+        mock.patch.object(query, "datetime", _frozen_datetime_class(instant)),
+        mock.patch.object(query, "time_decay_score", clamped),
+    ):
         yield
 
 
@@ -241,6 +285,43 @@ def validate_queries(conn, queries):
     )
     ambiguous = sum(1 for q in usable if prefixes[q.session_id[:SESSION_PREFIX_LEN]] > 1)
     return usable, stale, ambiguous
+
+
+def _parse_timestamp(value):
+    """Segment timestamp -> aware UTC datetime, or None when it cannot be parsed."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def clock_info(conn, frozen_now):
+    """How far the corpus has moved past the frozen clock (MAX(segments.timestamp))."""
+    newest = conn.execute("SELECT MAX(timestamp) FROM segments").fetchone()[0]
+    parsed = _parse_timestamp(newest)
+    days = None if parsed is None else (parsed - frozen_now).total_seconds() / 86400
+    return {
+        "newest_segment_at": newest if isinstance(newest, str) else None,
+        "days_after_frozen_now": None if days is None else round(days, 3),
+        "drift_warning": days is not None and days > CLOCK_DRIFT_DAYS,
+    }
+
+
+def clock_warnings(report):
+    clock = report.get("clock") or {}
+    if not clock.get("drift_warning"):
+        return []
+    return [
+        f"newest segment is {clock['days_after_frozen_now']:.1f} days after frozen_now "
+        f"({report['frozen_now']}); newer rows are clamped to frozen_now, but results still "
+        "drift as the corpus grows. Re-save the baseline on the old code against the current "
+        "corpus before comparing a candidate (see docs/EVAL.md)"
+    ]
 
 
 def vector_status():
@@ -445,20 +526,23 @@ def git_info():
     return {"sha": sha, "dirty": dirty}
 
 
-def build_report(*, k, frozen_now, loaded, usable, stale, ambiguous, pipelines, results, vector):
+def build_report(
+    *, k, frozen_now, loaded, usable, stale, ambiguous, pipelines, results, vector, clock
+):
     return {
         "schema": REPORT_SCHEMA,
         "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "git": git_info(),
         "k": k,
         "frozen_now": frozen_now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "clock": clock,
         "queries": {
             "total": len(loaded),
             "evaluated": len(usable),
             "stale": len(stale),
             "ambiguous_session_prefix": ambiguous,
             "by_type": {t: sum(q.type == t for q in usable) for t in QUERY_TYPES},
-            "sha256": queries_digest(loaded),
+            "usable_sha256": queries_digest(usable),
         },
         "vector": vector if "hybrid" in pipelines else None,
         "pipelines": {name: results[name] for name in pipelines},
@@ -488,8 +572,12 @@ def write_run_report(eval_dir, report):
     return write_json(path, report)
 
 
+def baseline_path(eval_dir):
+    return Path(eval_dir) / "baseline.json"
+
+
 def load_baseline(explicit, eval_dir):
-    path = Path(explicit) if explicit else Path(eval_dir) / "baseline.json"
+    path = Path(explicit) if explicit else baseline_path(eval_dir)
     if not path.is_file():
         if explicit:
             raise EvalInputError(f"baseline not found: {path}")
@@ -505,33 +593,140 @@ def load_baseline(explicit, eval_dir):
     return baseline
 
 
-def compare_reports(current, baseline, threshold):
-    """Deltas (current - baseline) per pipeline; a gate metric dropping by > threshold fails."""
-    deltas, regressions, notes = {}, [], []
-    for key in ("k", "frozen_now"):
-        if current.get(key) != baseline.get(key):
-            notes.append(f"{key} differs from baseline; numbers are not directly comparable")
-    cur_sha = (current.get("queries") or {}).get("sha256")
-    base_sha = (baseline.get("queries") or {}).get("sha256")
-    if cur_sha != base_sha:
-        notes.append("query set differs from baseline; numbers are not directly comparable")
-    for name, pdata in current["pipelines"].items():
-        base_pipeline = baseline["pipelines"].get(name)
-        if base_pipeline is None:
-            notes.append(f"{name}: not in baseline; skipped")
-            continue
-        cur, base = pdata["overall"], base_pipeline["overall"]
-        deltas[name] = {
-            m: round(cur[m] - base[m], 9)
-            for m in COMPARE_METRICS
-            if cur.get(m) is not None and base.get(m) is not None
-        }
-        regressions += [
-            (name, m, deltas[name][m])
-            for m in GATE_METRICS
-            if m in deltas[name] and -deltas[name][m] > threshold
+def _usable_entry(entry):
+    """A pipeline entry the comparison can read (a dict with an `overall` dict)."""
+    return isinstance(entry, dict) and isinstance(entry.get("overall"), dict)
+
+
+def baseline_problems(current, baseline):
+    """Why `baseline` cannot be compared with `current` at all (empty list: comparable).
+
+    Run-wide checks only; which pipelines the baseline covers is checked by compare_reports.
+    A differing schema is reported alone: the other fields may not mean the same thing.
+    """
+    if current.get("schema") != baseline.get("schema"):
+        return [
+            f"report schema differs (run {current.get('schema')}, baseline "
+            f"{baseline.get('schema')}): the baseline was written by a different harness version"
         ]
-    return {"deltas": deltas, "regressions": regressions, "notes": notes}
+    problems = []
+    if current.get("k") != baseline.get("k"):
+        problems.append(f"k differs (run {current.get('k')}, baseline {baseline.get('k')})")
+    if current.get("frozen_now") != baseline.get("frozen_now"):
+        problems.append(
+            f"frozen_now differs (run {current.get('frozen_now')}, "
+            f"baseline {baseline.get('frozen_now')})"
+        )
+    cur_q, base_q = current.get("queries") or {}, baseline.get("queries") or {}
+    cur_digest, base_digest = cur_q.get("usable_sha256"), base_q.get("usable_sha256")
+    if cur_digest is None or cur_digest != base_digest:
+        problems.append(
+            "evaluated query set differs "
+            f"(run {cur_q.get('evaluated')} queries, baseline {base_q.get('evaluated')})"
+        )
+    return problems
+
+
+def _gate_slices(cur_pipeline, base_pipeline):
+    """(slice, current metrics, baseline metrics) for the overall numbers and each query type."""
+    slices = [("all", cur_pipeline["overall"], base_pipeline["overall"])]
+    cur_types = cur_pipeline.get("by_type") or {}
+    base_types = base_pipeline.get("by_type") or {}
+    for qtype in QUERY_TYPES:
+        if isinstance(cur_types.get(qtype), dict) and isinstance(base_types.get(qtype), dict):
+            slices.append((qtype, cur_types[qtype], base_types[qtype]))
+    return slices
+
+
+def compare_reports(current, baseline, threshold):
+    """Compare a run with a baseline; a gate metric dropping by more than `threshold` fails.
+
+    Fail closed: if the baseline is not comparable (different schema, k, frozen_now or evaluated
+    query set) or does not cover every pipeline of the run, `comparable` is False and nothing is
+    gated. Otherwise every pipeline is gated on its overall numbers, and on each query type whose
+    slice has at least MIN_GATE_N queries in both runs.
+
+    Returns {comparable, problems, deltas: {pipeline: {slice: {metric: delta}}},
+             regressions: [(pipeline, slice, metric, delta)], ungated: [(pipeline, slice)], notes}.
+    """
+    result = {
+        "comparable": False, "problems": baseline_problems(current, baseline),
+        "deltas": {}, "regressions": [], "ungated": [], "notes": [],
+    }
+    base_pipelines = baseline.get("pipelines") or {}
+    for name in current["pipelines"]:
+        if not _usable_entry(base_pipelines.get(name)):
+            covered = ", ".join(n for n in PIPELINE_NAMES if _usable_entry(base_pipelines.get(n)))
+            result["problems"].append(
+                f"{name} is not in the baseline (baseline covers: {covered or 'nothing'})"
+            )
+    if result["problems"]:
+        return result
+    result["comparable"] = True
+    cur_stale = (current.get("queries") or {}).get("stale")
+    base_stale = (baseline.get("queries") or {}).get("stale")
+    if cur_stale != base_stale:
+        result["notes"].append(
+            f"stale query count differs (run {cur_stale}, baseline {base_stale}); "
+            "the evaluated set is identical"
+        )
+    for name, pdata in current["pipelines"].items():
+        result["deltas"][name] = {}
+        for label, cur, base in _gate_slices(pdata, base_pipelines[name]):
+            deltas = {
+                m: round(cur[m] - base[m], 9)
+                for m in COMPARE_METRICS
+                if cur.get(m) is not None and base.get(m) is not None
+            }
+            result["deltas"][name][label] = deltas
+            if label != "all" and min(cur.get("n") or 0, base.get("n") or 0) < MIN_GATE_N:
+                result["ungated"].append((name, label))
+                continue
+            result["regressions"] += [
+                (name, label, m, deltas[m])
+                for m in GATE_METRICS
+                if m in deltas and -deltas[m] > threshold
+            ]
+    return result
+
+
+def _provenance(report):
+    return {"created_at": report.get("created_at"), "git": report.get("git")}
+
+
+def merge_baseline(existing, report):
+    """The baseline to write for `report`, merged per pipeline into a compatible `existing`.
+
+    A partial run must not silently shrink the baseline, so pipelines the run did not cover are
+    carried over from `existing` (their `sources` entry keeps when and at which commit they were
+    measured). If `existing` is not comparable with this run (different k, frozen_now, evaluated
+    set or schema) it is replaced and its other pipelines are dropped.
+
+    Returns (baseline, carried, dropped) with the carried / dropped pipeline names.
+    """
+    sources = {name: _provenance(report) for name in report["pipelines"]}
+    fresh = {**report, "sources": sources}
+    if existing is None:
+        return fresh, [], []
+    old = {n: e for n, e in existing["pipelines"].items() if _usable_entry(e)}
+    others = [n for n in PIPELINE_NAMES if n in old and n not in report["pipelines"]]
+    if baseline_problems(report, existing):
+        return fresh, [], others
+    old_sources = existing.get("sources") or {}
+    for name in others:
+        sources[name] = old_sources.get(name) or _provenance(existing)
+    pipelines = {n: p for n, p in {**old, **report["pipelines"]}.items() if n in PIPELINE_NAMES}
+    ordered = {n: pipelines[n] for n in PIPELINE_NAMES if n in pipelines}
+    merged = {**report, "pipelines": ordered, "sources": {n: sources[n] for n in ordered}}
+    if report["vector"] is None:
+        merged["vector"] = existing.get("vector")
+    return merged, others, []
+
+
+def comparison_status(comparison):
+    if not comparison["comparable"]:
+        return EXIT_INCOMPARABLE
+    return EXIT_REGRESSION if comparison["regressions"] else EXIT_OK
 
 
 # ------------------------------------------------------------------- formatting
@@ -590,17 +785,34 @@ def format_summary(report):
     return "\n".join(lines)
 
 
+RESAVE_HINT = (
+    "to accept this run as the baseline, re-run with --save-baseline (all pipelines, or just "
+    "the missing ones to merge into a compatible baseline)"
+)
+
+
 def format_comparison(comparison, threshold):
-    rows = [["pipeline", "d_hit@1", "d_hit@5", "d_mrr", "d_sess@5", "d_empty", "gate"]]
-    failed = {name for name, _, _ in comparison["regressions"]}
-    for name, d in comparison["deltas"].items():
-        rows.append([
-            name, *(f"{d[m]:+.3f}" if m in d else "-" for m in COMPARE_METRICS),
-            "FAIL" if name in failed else "ok",
-        ])
+    if not comparison["comparable"]:
+        lines = ["baseline not comparable; nothing was gated:"]
+        lines += [f"  - {p}" for p in comparison["problems"]]
+        lines.append(RESAVE_HINT)
+        return "\n".join(lines)
+    rows = [["pipeline", "slice", "d_hit@1", "d_hit@5", "d_mrr", "d_sess@5", "d_empty", "gate"]]
+    failed = {(name, label) for name, label, _, _ in comparison["regressions"]}
+    ungated = set(comparison["ungated"])
+    for name, slices in comparison["deltas"].items():
+        for i, (label, d) in enumerate(slices.items()):
+            gate = "FAIL" if (name, label) in failed else (
+                f"n<{MIN_GATE_N}" if (name, label) in ungated else "ok"
+            )
+            rows.append([
+                name if i == 0 else "", label,
+                *(f"{d[m]:+.3f}" if m in d else "-" for m in COMPARE_METRICS), gate,
+            ])
     lines = [
-        f"vs baseline (gate: session hit@5 / MRR drop > {threshold}):",
-        _render(rows, left=1),
+        f"vs baseline (gate: session hit@5 / MRR drop > {threshold}; "
+        f"query-type slices gated at n >= {MIN_GATE_N}):",
+        _render(rows, left=2),
     ]
     lines += [f"note: {n}" for n in comparison["notes"]]
     return "\n".join(lines)
@@ -648,13 +860,15 @@ def parse_args(argv=None):
     parser.add_argument("--eval-dir", type=Path, default=None,
                         help="dir with queries.jsonl [meta.json] (default: <state dir>/eval)")
     parser.add_argument("--k", type=_positive_int, default=DEFAULT_K,
-                        help="result depth for fts/hybrid and the MRR cutoff (default: 10)")
+                        help="result depth for fts/hybrid and the MRR cutoff "
+                             f"(default: {DEFAULT_K}, the production default)")
     parser.add_argument("--pipelines", type=_pipeline_list, default=list(PIPELINE_NAMES),
                         help="comma list of hook,fts,hybrid (default: all)")
     parser.add_argument("--baseline", type=Path, default=None,
                         help="baseline report to compare with (default: <eval-dir>/baseline.json)")
     parser.add_argument("--save-baseline", action="store_true",
-                        help="also write this run as <eval-dir>/baseline.json")
+                        help="also write this run to <eval-dir>/baseline.json (pipelines not in "
+                             "this run are kept when the existing baseline is comparable)")
     parser.add_argument("--threshold", type=_non_negative_float, default=DEFAULT_THRESHOLD,
                         help="max allowed absolute drop in session hit@5 / MRR (default: 0.03)")
     return parser.parse_args(argv)
@@ -674,15 +888,25 @@ def prepare_queries(eval_dir):
     return loaded
 
 
+@dataclass(frozen=True)
+class EvalRun:
+    report: dict
+    baseline: dict | None  # what the run is compared with
+    existing: dict | None  # what --save-baseline merges into (<eval-dir>/baseline.json)
+    eval_dir: Path
+
+
 def execute(args):
     eval_dir = Path(args.eval_dir) if args.eval_dir else Path(config.STATE_DIR) / "eval"
     loaded = prepare_queries(eval_dir)
     frozen_now = load_frozen_now(eval_dir)
     baseline = load_baseline(args.baseline, eval_dir)
+    existing = load_baseline(None, eval_dir) if args.save_baseline else None
     db_path = preflight_db()
     conn = open_readonly(db_path)
     try:
         usable, stale, ambiguous = validate_queries(conn, loaded)
+        clock = clock_info(conn, frozen_now)
     finally:
         conn.close()
     if not usable:
@@ -692,32 +916,84 @@ def execute(args):
     report = build_report(
         k=args.k, frozen_now=frozen_now, loaded=loaded, usable=usable, stale=stale,
         ambiguous=ambiguous, pipelines=args.pipelines, results=results, vector=vector,
+        clock=clock,
     )
-    return report, baseline, eval_dir
+    return EvalRun(report, baseline, existing, eval_dir)
+
+
+def save_baseline(run, status):
+    """Write <eval-dir>/baseline.json (merged per pipeline) and describe what happened."""
+    merged, carried, dropped = merge_baseline(run.existing, run.report)
+    target = write_json(baseline_path(run.eval_dir), merged)
+    lines = [f"baseline saved: {target} (pipelines: {', '.join(merged['pipelines'])})"]
+    if carried:
+        lines.append(
+            f"merged: kept {', '.join(carried)} from the earlier baseline "
+            "(`sources` records when each pipeline was measured)"
+        )
+    if dropped:
+        lines.append(
+            "warning: the earlier baseline was not comparable with this run and was replaced; "
+            f"dropped pipelines: {', '.join(dropped)}"
+        )
+    missing = [n for n in PIPELINE_NAMES if n not in merged["pipelines"]]
+    if missing:
+        lines.append(
+            f"note: the baseline does not cover {', '.join(missing)}; a run that includes them "
+            "is incomparable (exit 3) until they are saved too"
+        )
+    if status == EXIT_REGRESSION:
+        lines.append(
+            "note: the gate failed above (regression, exit 1); the baseline was saved anyway"
+        )
+    elif status == EXIT_INCOMPARABLE:
+        lines.append(
+            "note: the old baseline was not comparable (nothing gated, exit 3); "
+            "the baseline was saved anyway"
+        )
+    return "\n".join(lines)
+
+
+def describe_exception(exc):
+    """Exception type and raise site. Never the message: it may echo query text."""
+    frames = traceback.extract_tb(exc.__traceback__)
+    if not frames:
+        return type(exc).__name__
+    last = frames[-1]
+    return f"{type(exc).__name__} at {Path(last.filename).name}:{last.lineno} in {last.name}"
+
+
+def run_cli(args):
+    run = execute(args)
+    report = run.report
+    path = write_run_report(run.eval_dir, report)
+    print(format_summary(report))
+    print(format_table(report))
+    for warning in hybrid_warnings(report) + clock_warnings(report):
+        print(f"warning: {warning}", file=sys.stderr)
+    print(f"report: {path}")
+    status = EXIT_OK
+    if run.baseline is None:
+        print("no baseline to compare with; nothing was gated (--save-baseline records one)")
+    else:
+        comparison = compare_reports(report, run.baseline, args.threshold)
+        print(format_comparison(comparison, args.threshold))
+        status = comparison_status(comparison)
+    if args.save_baseline:
+        print(save_baseline(run, status))
+    return status
 
 
 def main(argv=None):
     args = parse_args(argv)
     try:
-        report, baseline, eval_dir = execute(args)
-        path = write_run_report(eval_dir, report)
+        return run_cli(args)
     except EvalInputError as e:
         print(f"eval_search: error: {e}", file=sys.stderr)
-        return EXIT_ERROR
-    print(format_summary(report))
-    print(format_table(report))
-    for warning in hybrid_warnings(report):
-        print(f"warning: {warning}", file=sys.stderr)
-    print(f"report: {path}")
-    status = EXIT_OK
-    if baseline is not None:
-        comparison = compare_reports(report, baseline, args.threshold)
-        print(format_comparison(comparison, args.threshold))
-        if comparison["regressions"]:
-            status = EXIT_REGRESSION
-    if args.save_baseline:
-        print(f"baseline saved: {write_json(Path(eval_dir) / 'baseline.json', report)}")
-    return status
+        return EXIT_INPUT_ERROR
+    except Exception as e:  # noqa: BLE001 - last resort; never echo the message (query text)
+        print(f"eval_search: unexpected error: {describe_exception(e)}", file=sys.stderr)
+        return EXIT_UNEXPECTED
 
 
 if __name__ == "__main__":
