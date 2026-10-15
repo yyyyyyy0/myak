@@ -40,8 +40,9 @@ MAX_CODEX_CHARS = 1000
 HOOK_MAX_RESULTS = 3
 HOOK_SNIPPET_CHARS = 220
 
-# 検索品質: 閾値フィルタ
-MIN_RELATIVE_SCORE = 0.35  # best score 比
+# 検索品質: 閾値フィルタ。スコア下限は減衰前の bm25 (FTS5 rank の絶対値) に対して判定する
+# (時間減衰後の値や RRF の融合スコアには使わない。query.filter_results 参照)
+MIN_RELATIVE_SCORE = 0.35  # 結果中の最大 bm25 比
 MIN_ABSOLUTE_SCORE = 0.03
 MIN_MATCHING_TOKENS = 2    # TOKEN_MATCH_GUARD 以上のトークン数で適用
 TOKEN_MATCH_GUARD = 3
