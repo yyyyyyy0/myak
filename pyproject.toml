@@ -54,3 +54,9 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
+
+[tool.uv]
+# fastembed 0.9.0 pins pillow<13, which carries known vulnerabilities (fixed in 13.0.0).
+# myak only uses fastembed's text embeddings, not image features. Remove once fastembed lifts the cap.
+# Repo-side only: not written into the wheel metadata, so `pip install myak[vec]` still resolves pillow<13.
+override-dependencies = ["pillow>=13.0.0"]
