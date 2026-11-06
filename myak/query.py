@@ -157,11 +157,11 @@ def format_json(results):
     return json.dumps(
         [
             {
-                "timestamp": r["timestamp"],
+                "timestamp": r.get("full_timestamp") or r["timestamp"],
                 "project": r["project"],
                 "role": r["role"],
                 "source": r.get("agent_source"),
-                "session_id": r["session_id"],
+                "session_id": r.get("full_session_id") or r["session_id"],
                 "content": r["content"],
             }
             for r in results

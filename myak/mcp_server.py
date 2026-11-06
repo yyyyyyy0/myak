@@ -57,7 +57,7 @@ def myak_search(query: str, limit: int = 5, source: str | None = None) -> str:
         raise ToolError("Query too short (min 3 chars)")
     limit = max(1, min(limit, 20))
     sources = None
-    if source is not None:
+    if source is not None and source.strip():
         sources = [source.strip().lower()]
     fetch = fetch_limit(limit, bool(sources))
     try:

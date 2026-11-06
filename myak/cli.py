@@ -139,14 +139,19 @@ def cmd_migrate(dry_run):
 
 def cmd_save(args):
     from myak import source as source_mod
-    from myak.save import save_memory
+    from myak.save import MAX_CONTENT_CHARS, save_memory
 
     if not args.text or args.text == ["-"]:
-        content = sys.stdin.read().strip()
+        try:
+            # 上限 + 1 文字だけ読む (巨大な入力を丸ごとメモリに載せない。超過は save 側で拒否)
+            content = sys.stdin.read(MAX_CONTENT_CHARS + 1).strip()
+        except (UnicodeDecodeError, OSError) as e:
+            print(f"Error: could not read stdin ({type(e).__name__})", file=sys.stderr)
+            return 1
     else:
         content = " ".join(args.text)
     try:
-        src = source_mod.validate_source(args.source) if args.source else (
+        src = source_mod.validate_source(args.source) if args.source is not None else (
             source_mod.cli_default_source()
         )
     except source_mod.InvalidSource as e:

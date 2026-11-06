@@ -264,6 +264,30 @@ def test_cli_save_failures_exit_nonzero(mem, capsys):
     assert cli.main(["save", "x" * 4001]) == 1
 
 
+def test_cli_save_empty_source_is_rejected(mem, capsys):
+    assert cli.main(["save", "--source", "", "long enough text here"]) == 1
+    assert "Invalid source" in capsys.readouterr().err
+
+
+def test_cli_save_stdin_is_bounded(mem, monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdin", io.StringIO("y" * 100_000))
+    assert cli.main(["save", "-"]) == 1
+    assert "too long (4001 chars" in capsys.readouterr().err
+
+
+def test_cli_save_stdin_decode_error_exits_cleanly(mem, monkeypatch, capsys):
+    raw = io.TextIOWrapper(io.BytesIO(b"\xff\xfe not utf-8 at all"), encoding="utf-8")
+    monkeypatch.setattr("sys.stdin", raw)
+    assert cli.main(["save", "-"]) == 1
+    assert "could not read stdin" in capsys.readouterr().err
+
+
+def test_mcp_search_empty_source_means_no_filter(mem):
+    save_memory("wombat checklist from muse agent", source="muse", session_id="desktop-a")
+    out = mcp_server.myak_search("wombat checklist", source="  ")
+    assert "muse agent" in out
+
+
 def test_cli_save_duplicate(mem, capsys):
     cli.main(["save", "--session-id", "desktop-z", "same text twice over"])
     cli.main(["save", "--session-id", "desktop-z", "same text twice over"])
@@ -294,6 +318,9 @@ def test_query_json_and_source_filter(mixed, capsys):
     assert len(data) == 1
     assert set(data[0]) == {"timestamp", "project", "role", "source", "session_id", "content"}
     assert data[0]["source"] == "muse" and data[0]["project"] == "muse"
+    # --json は session_id と timestamp を切り詰めない
+    assert data[0]["session_id"] == "desktop-a"
+    assert "T" in data[0]["timestamp"]
 
 
 def test_query_project_filter_case_insensitive(mixed, capsys):

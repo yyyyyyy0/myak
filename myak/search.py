@@ -88,6 +88,9 @@ def _result(row, score, source="fts", bm25=None, segment_id=None):
         "content": content[:MAX_SNIPPET_CHARS],
         "timestamp": timestamp[:10] if timestamp else "",
         "session_id": session_id[:8],
+        # 機械可読出力 (--json) 用の切り詰めない値
+        "full_session_id": session_id,
+        "full_timestamp": timestamp or "",
         "project": project or "",
         "score": score,
         "agent_type": agent_type,
