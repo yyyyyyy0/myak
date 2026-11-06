@@ -107,5 +107,6 @@ def test_save_rejects_invalid_session_id(mem, sid):
         myak_save("remember the unique platypus checklist", session_id=sid)
 
 
-def test_save_memory_still_truncates_as_safety_net(mem):
-    assert mcp_server.save_memory("z" * 5000, session_id="desktop-s")["saved"]
+def test_save_memory_rejects_overlong_content_instead_of_truncating(mem):
+    r = mcp_server.save_memory("z" * 5000, session_id="desktop-s")
+    assert not r["saved"] and "too long" in r["reason"]

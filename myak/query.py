@@ -131,13 +131,53 @@ def filter_hybrid(results, query):
     return filter_results(results, tokenize_query_terms(query))
 
 
+OVERFETCH = 5  # source / project で絞る前に多めに取る倍率
+OVERFETCH_CAP = 200
+
+
+def fetch_limit(limit, filtered):
+    """絞り込みを後段で掛けるときの取得件数 (結果数が減りすぎないよう多めに取る)。"""
+    return min(limit * OVERFETCH, max(limit, OVERFETCH_CAP)) if filtered else limit
+
+
+def filter_by_source(results, sources):
+    """書き込み元 (agent_source) が sources のいずれかの結果だけ残す。不明 (None) は除く。"""
+    wanted = {s.strip().lower() for s in sources}
+    return [r for r in results if r.get("agent_source") in wanted]
+
+
+def filter_by_project(results, needles):
+    """project パスに needles のいずれかを (大文字小文字を無視して) 含む結果だけ残す。"""
+    lowered = [n.lower() for n in needles]
+    return [r for r in results if any(n in (r["project"] or "").lower() for n in lowered)]
+
+
+def format_json(results):
+    """機械可読出力 (他エージェント向け)。"""
+    return json.dumps(
+        [
+            {
+                "timestamp": r["timestamp"],
+                "project": r["project"],
+                "role": r["role"],
+                "source": r.get("agent_source"),
+                "session_id": r["session_id"],
+                "content": r["content"],
+            }
+            for r in results
+        ],
+        ensure_ascii=False,
+    )
+
+
 def format_plain(results, query):
     if not results:
         return f"No memories found for: {query}"
     lines = [f"## Memory search: {query}", ""]
     for r in results:
         project = r["project"].split("-")[-1] if r["project"] else "?"
-        lines.append(f"[{r['timestamp']} | {project} | {r['role']}]")
+        agent = r.get("agent_source") or "?"
+        lines.append(f"[{r['timestamp']} | {project} | {r['role']} | {agent}]")
         lines.append(r["content"])
         lines.append("")
     return "\n".join(lines)
@@ -165,8 +205,10 @@ def format_hook(results, query):
         # 改行を畳み、過去メッセージが見出し行などを偽造できないようにする
         snippet = _flat(r["content"][:HOOK_SNIPPET_CHARS])
         stamp = _flat(r["timestamp"])
+        agent = _flat(r.get("agent_source") or "?")
         lines.append(
-            f'<past-memory untrusted="true" date="{stamp}" project="{_flat(project)}">'
+            f'<past-memory untrusted="true" date="{stamp}" project="{_flat(project)}" '
+            f'source="{agent}">'
             f"{snippet}</past-memory>"
         )
         lines.append("")
@@ -241,6 +283,15 @@ def main(argv=None):
         "--hybrid", action=argparse.BooleanOptionalAction, default=None,
         help="Use vector search too when myak[vec] is available (default: on)",
     )
+    parser.add_argument(
+        "--source", action="append", default=[],
+        help="Only memories written by this agent (repeatable, e.g. claude-code, muse)",
+    )
+    parser.add_argument(
+        "--project", action="append", default=[],
+        help="Only memories whose project path contains this text (repeatable)",
+    )
+    parser.add_argument("--json", action="store_true", help="Machine-readable JSON output")
     args = parser.parse_args(argv)
 
     query = " ".join(args.query) if args.query else ""
@@ -266,10 +317,18 @@ def main(argv=None):
 
     if args.hybrid is None:
         args.hybrid = not config.vec_disabled()
-    results = search(query, args.limit, use_vec=args.hybrid)
+    filtered = bool(args.source or args.project)
+    results = search(query, fetch_limit(args.limit, filtered), use_vec=args.hybrid)
     results = filter_hybrid(results, query)
+    if args.source:
+        results = filter_by_source(results, args.source)
+    if args.project:
+        results = filter_by_project(results, args.project)
+    results = results[: args.limit]
 
-    if args.codex:
+    if args.json:
+        print(format_json(results))
+    elif args.codex:
         output = format_codex(results, query)
         if output:
             print(output)

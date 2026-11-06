@@ -8,7 +8,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-CURRENT_VERSION = 2
+CURRENT_VERSION = 3
 KEEP_BACKUPS = 3
 
 _V0_TABLES = """
@@ -77,6 +77,10 @@ _CWD_INDEX = (
 
 _V2_STEPS = (_CWD_INDEX,)
 
+# 書き込んだエージェント名。既存行は更新しない (segments_au が全行の FTS を作り直すため)。
+# NULL は旧データを表し、読み出し側が uuid から推定する。
+_V3_STEPS = ("ALTER TABLE segments ADD COLUMN source TEXT",)
+
 
 class SchemaTooNew(RuntimeError):
     """DB の user_version がこのコードより新しい。"""
@@ -142,6 +146,7 @@ def create_schema(conn):
                 ",\n        uuid TEXT"
                 ",\n        agent_id TEXT NOT NULL DEFAULT ''"
                 ",\n        agent_type TEXT"
+                ",\n        source TEXT"
             ),
         )
         + _FTS_AND_TRIGGERS
@@ -236,7 +241,7 @@ def make_backup(conn, tag, backup_dir=None):
 
 
 def migrate(conn, *, backup_dir=None):
-    """v0/v1 → 現行版。明示的にのみ呼ぶ。結果 dict を返す。
+    """v0/v1/v2 → 現行版。明示的にのみ呼ぶ。結果 dict を返す。
 
     バックアップは BEGIN IMMEDIATE の前に取る (バックアップ中も他プロセスの書き込みを
     止めないため)。バックアップ後〜ロック取得前の書き込みはバックアップに含まれないが、
@@ -266,7 +271,11 @@ def migrate(conn, *, backup_dir=None):
 
     conn.execute("BEGIN IMMEDIATE")
     try:
-        steps = (_V1_STEPS if version < 1 else ()) + _V2_STEPS
+        steps = (
+            (_V1_STEPS if version < 1 else ())
+            + (_V2_STEPS if version < 2 else ())
+            + (_V3_STEPS if version < 3 else ())
+        )
         for sql in steps:
             _exec(conn, sql)
         conn.execute(f"PRAGMA user_version={CURRENT_VERSION}")

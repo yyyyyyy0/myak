@@ -14,6 +14,7 @@ from myak import config, vec
 from myak import query as _query
 from myak.config import MAX_SNIPPET_CHARS, SUBAGENT_WEIGHT, get_connection
 from myak.db import CURRENT_VERSION, schema_version
+from myak.source import derive_legacy_source
 
 logger = logging.getLogger("myak.search")
 
@@ -52,7 +53,8 @@ def _fetch_rows(conn, ids):
     marks = ",".join("?" * len(ids))
     rows = conn.execute(
         "SELECT s.id, s.role, s.content, s.timestamp, s.session_id, se.project_path, "
-        "s.agent_type FROM segments s JOIN sessions se ON se.session_id = s.session_id "
+        "s.agent_type, s.source, s.uuid FROM segments s "
+        "JOIN sessions se ON se.session_id = s.session_id "
         f"WHERE s.id IN ({marks})",
         list(ids),
     ).fetchall()
@@ -80,7 +82,7 @@ def _result(row, score, source="fts", bm25=None, segment_id=None):
     (ベクトルのみのヒットは None)。`segment_id` は内部用 (評価ハーネス向け)。
     公開フォーマッタはどれも参照しない。
     """
-    role, content, timestamp, session_id, project, agent_type = row
+    role, content, timestamp, session_id, project, agent_type, written_by, uuid = row
     return {
         "role": role,
         "content": content[:MAX_SNIPPET_CHARS],
@@ -89,6 +91,9 @@ def _result(row, score, source="fts", bm25=None, segment_id=None):
         "project": project or "",
         "score": score,
         "agent_type": agent_type,
+        # 書き込んだエージェント (保存値、無ければ uuid から推定。不明は None)。
+        # "source" は検索経路 (fts/vec/both) の既存キーなので別名にしている。
+        "agent_source": derive_legacy_source(written_by, uuid),
         "source": source,
         "bm25": bm25,
         "segment_id": segment_id,

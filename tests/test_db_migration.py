@@ -97,14 +97,14 @@ def counts(conn):
 def test_fresh_db_created_at_v1(tmp_path):
     conn = sqlite3.connect(str(tmp_path / "n.db"), isolation_level=None)
     db.create_schema(conn)
-    assert db.schema_version(conn) == 2
+    assert db.schema_version(conn) == db.CURRENT_VERSION
     cols = {r[1] for r in conn.execute("PRAGMA table_info(segments)")}
     assert {"uuid", "agent_id", "agent_type"} <= cols
     assert "cwd" in {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
     assert db.require_current(conn)
     # 再実行は no-op
     db.create_schema(conn)
-    assert db.schema_version(conn) == 2
+    assert db.schema_version(conn) == db.CURRENT_VERSION
 
 
 def test_create_schema_leaves_v0_untouched(v0):
@@ -117,7 +117,7 @@ def test_migrate_v0_to_v1(v0, tmp_path):
     before = counts(v0)
     result = db.migrate(v0)
     assert result["status"] == "migrated"
-    assert db.schema_version(v0) == 2
+    assert db.schema_version(v0) == db.CURRENT_VERSION
     assert counts(v0) == before == (3, 5)
     assert (result["sessions"], result["segments"]) == before
     hit = v0.execute(
@@ -167,13 +167,13 @@ def test_migrate_default_backup_in_state_dir_0600_and_pruned(tmp_path, monkeypat
 def test_migrate_idempotent(v0):
     db.migrate(v0)
     again = db.migrate(v0)
-    assert again == {"status": "already-current", "version": 2}
+    assert again == {"status": "already-current", "version": db.CURRENT_VERSION}
 
 
 def test_migrate_empty_db_creates(tmp_path):
     conn = sqlite3.connect(str(tmp_path / "e.db"), isolation_level=None)
     assert db.migrate(conn)["status"] == "created"
-    assert db.schema_version(conn) == 2
+    assert db.schema_version(conn) == db.CURRENT_VERSION
 
 
 def test_schema_too_new(v0):
@@ -260,7 +260,7 @@ def test_create_schema_is_atomic(tmp_path, monkeypatch):
 def test_create_schema_default_isolation_conn(tmp_path):
     conn = sqlite3.connect(str(tmp_path / "d.db"))
     db.create_schema(conn)
-    assert db.schema_version(conn) == 2
+    assert db.schema_version(conn) == db.CURRENT_VERSION
     assert not conn.in_transaction
 
 
@@ -316,7 +316,7 @@ def test_migrate_v1_to_v2_preserves_counts(tmp_path):
     assert not _idx(conn)
     result = db.migrate(conn, backup_dir=tmp_path / "bk")
     assert result["status"] == "migrated" and result["from"] == 1
-    assert db.schema_version(conn) == 2
+    assert db.schema_version(conn) == db.CURRENT_VERSION
     assert counts(conn) == before == (3, 5)
     assert _idx(conn)
     assert list((tmp_path / "bk").glob("memory.db.bak-v1-*"))
