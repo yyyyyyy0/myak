@@ -35,7 +35,7 @@ def corpus(db_env, day):
 
 
 def expected_plain(day):
-    return f"## Memory search: {QUERY}\n\n[{day} | beta | user]\n{CONTENT}\n"
+    return f"## Memory search: {QUERY}\n\n[{day} | beta | user | claude-code]\n{CONTENT}\n"
 
 
 def expected_codex(day):
@@ -48,7 +48,8 @@ def expected_hook(day):
     context = "\n".join([
         HOOK_HEADER,
         "",
-        f'<past-memory untrusted="true" date="{day}" project="beta">{CONTENT}</past-memory>',
+        f'<past-memory untrusted="true" date="{day}" project="beta" '
+        f'source="claude-code">{CONTENT}</past-memory>',
         "",
         HOOK_FOOTER,
     ])

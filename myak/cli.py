@@ -13,7 +13,7 @@ TEMPLATES_DIR = Path(str(files("myak") / "templates"))
 # 既存モジュールの main(argv) にそのまま委譲するサブコマンド
 PASSTHROUGH = {
     "index": ("myak.indexer", "run_from_cli", "Index a session transcript"),
-    "query": ("myak.query", "main", "Search memory (supports --hook/--codex/--limit)"),
+    "query": ("myak.query", "main", "Search memory (--hook/--codex/--json/--source/--project)"),
     "backfill": ("myak.backfill", "main", "Backfill all session transcripts"),
     "export": ("myak.export_obsidian", "main", "Export memory to an Obsidian vault"),
     "mcp": ("myak.mcp_server", "main", "Run the MCP server over stdio"),
@@ -30,6 +30,12 @@ def build_parser():
     for name, (_mod, _fn, helptext) in PASSTHROUGH.items():
         p = sub.add_parser(name, help=helptext, add_help=False)
         p.add_argument("args", nargs=argparse.REMAINDER)
+
+    sv = sub.add_parser("save", help="Save a memory (for local agents such as Muse)")
+    sv.add_argument("text", nargs="*", help="Text to save; read from stdin when '-' or omitted")
+    sv.add_argument("--source", help="Name of the writing agent (default: $MYAK_SOURCE or 'cli')")
+    sv.add_argument("--role", choices=["user", "assistant"], default="assistant")
+    sv.add_argument("--session-id", help="Session id to group saves (default: desktop-<timestamp>)")
 
     mig = sub.add_parser("migrate", help="Migrate the database schema (explicit only)")
     mig.add_argument("--dry-run", action="store_true", help="Print version and counts only")
@@ -131,6 +137,37 @@ def cmd_migrate(dry_run):
         conn.close()
 
 
+def cmd_save(args):
+    from myak import source as source_mod
+    from myak.save import MAX_CONTENT_CHARS, save_memory
+
+    if not args.text or args.text == ["-"]:
+        try:
+            # 上限 + 1 文字だけ読む (巨大な入力を丸ごとメモリに載せない。超過は save 側で拒否)
+            content = sys.stdin.read(MAX_CONTENT_CHARS + 1).strip()
+        except (UnicodeDecodeError, OSError) as e:
+            print(f"Error: could not read stdin ({type(e).__name__})", file=sys.stderr)
+            return 1
+    else:
+        content = " ".join(args.text)
+    try:
+        src = source_mod.validate_source(args.source) if args.source is not None else (
+            source_mod.cli_default_source()
+        )
+    except source_mod.InvalidSource as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    result = save_memory(content, role=args.role, session_id=args.session_id, source=src)
+    if not result["saved"]:
+        print(f"Failed to save: {result['reason']}", file=sys.stderr)
+        return 1
+    if result.get("duplicate"):
+        print(f"Already saved (duplicate, session: {result['session_id']})")
+    else:
+        print(f"Saved to memory (session: {result['session_id']}, source: {src})")
+    return 0
+
+
 def cmd_reindex(full):
     from myak import backfill, state
 
@@ -208,6 +245,8 @@ def main(argv=None):
         except Exception:  # noqa: BLE001
             pass
         return dispatch(args.event, stdin_text)
+    if args.command == "save":
+        return cmd_save(args)
     if args.command == "migrate":
         return cmd_migrate(args.dry_run)
     if args.command == "clean-legacy":

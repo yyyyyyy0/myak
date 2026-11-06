@@ -96,8 +96,9 @@ def _is_legacy_session(conn, session_id):
 
 
 _INSERT_SEGMENT = (
-    "INSERT INTO segments(session_id, role, content, timestamp, uuid, agent_id, agent_type) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+    "INSERT INTO segments"
+    "(session_id, role, content, timestamp, uuid, agent_id, agent_type, source) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, 'claude-code') "
     "ON CONFLICT(session_id, agent_id, uuid) WHERE uuid IS NOT NULL DO NOTHING"
 )
 

@@ -7,14 +7,14 @@ from myak.config import SUBAGENT_WEIGHT
 from myak.query import search
 
 SCHEMA = """
-PRAGMA user_version=2;
+PRAGMA user_version=3;
 CREATE TABLE sessions (
     session_id TEXT PRIMARY KEY, project_path TEXT, started_at TEXT,
     ended_at TEXT, segment_count INTEGER DEFAULT 0, indexed_at TEXT);
 CREATE TABLE segments (
     id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
     role TEXT NOT NULL, content TEXT NOT NULL, timestamp TEXT,
-    uuid TEXT, agent_id TEXT, agent_type TEXT);
+    uuid TEXT, agent_id TEXT, agent_type TEXT, source TEXT);
 CREATE VIRTUAL TABLE segments_fts USING fts5(
     content, content='segments', content_rowid='id', tokenize='trigram');
 CREATE TRIGGER segments_ai AFTER INSERT ON segments BEGIN

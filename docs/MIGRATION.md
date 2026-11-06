@@ -27,3 +27,14 @@ English | [日本語](MIGRATION.ja.md)
 - Add `.stignore` on every machine (`.stignore.example`).
 - Old sessions whose transcript is gone are never changed. Transcripts older than `cleanupPeriodDays` (30 by default) cannot be re-indexed.
 - A newer schema than the code is refused. Upgrade every machine before using one that has migrated.
+
+
+# Schema v2 to v3 (agent source column)
+
+v3 adds one nullable column, `segments.source`, so each memory records which agent wrote it. It only adds the column: no row is rewritten, so the FTS index is untouched.
+
+1. Update myak on every synced machine first. Code from before v3 refuses to write a v3 database and its hooks go quiet by design, so update before any machine migrates.
+2. Pick one machine and keep the others idle (Claude Code closed) until sync finishes.
+3. On that machine: `myak migrate --dry-run`, then `myak migrate`. It checks integrity, writes a `bak-v2-*` backup to `~/.claude/myak-state/backups/`, adds the column in one transaction and verifies row counts.
+4. Let Syncthing finish before starting the other machines. They need no migration if the DB arrived at v3 (`myak migrate --dry-run` shows it).
+5. Until a machine's DB is v3, its hooks log once and do nothing, and `myak save` / `myak_save` refuse to write. This is intended.

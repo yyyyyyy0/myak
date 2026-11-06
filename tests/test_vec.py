@@ -19,7 +19,7 @@ CREATE TABLE sessions (
 CREATE TABLE segments (
     id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
     role TEXT NOT NULL, content TEXT NOT NULL, timestamp TEXT,
-    uuid TEXT, agent_id TEXT, agent_type TEXT);
+    uuid TEXT, agent_id TEXT, agent_type TEXT, source TEXT);
 CREATE VIRTUAL TABLE segments_fts USING fts5(
     content, content='segments', content_rowid='id', tokenize='trigram');
 CREATE TRIGGER segments_ai AFTER INSERT ON segments BEGIN
